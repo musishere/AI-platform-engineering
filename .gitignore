@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+.DS_Store
+# Secrets (Claude API key, DB password) will live here. Never commit them.
+.env
