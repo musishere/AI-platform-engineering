@@ -27,9 +27,15 @@ def hash_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
 
-async def find_tenant_id(pool: asyncpg.Pool, key: str | None) -> int | None:
+async def find_tenant(pool: asyncpg.Pool, key: str | None) -> asyncpg.Record | None:
+    # Returns the tenant's id plus its limits, or None for an unknown key.
+    # One query for both, so adding limits cost no extra round trip.
     if not key:
         return None
-    return await pool.fetchval(
-        "SELECT id FROM tenants WHERE api_key_hash = $1", hash_key(key)
+    return await pool.fetchrow(
+        """
+        SELECT id, burst, refill_per_second, monthly_token_quota
+        FROM tenants WHERE api_key_hash = $1
+        """,
+        hash_key(key),
     )

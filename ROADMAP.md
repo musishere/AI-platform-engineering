@@ -60,9 +60,9 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 **Goal:** Enforce per-tenant rate limits and monthly token quotas in the gateway using Redis.
 
 **What to build**
-- [ ] Token bucket rate limiter in Redis
-- [ ] Monthly token quota per tenant
-- [ ] Reject requests that exceed the rate limit or the quota
+- [x] Token bucket rate limiter in Redis
+- [x] Monthly token quota per tenant
+- [x] Reject requests that exceed the rate limit or the quota
 
 **What I'll learn**
 - How the token bucket algorithm works
@@ -70,9 +70,9 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 - Keeping quota counts correct under concurrent requests
 
 **Done when**
-- [ ] A burst above a tenant's limit gets rejected while normal traffic passes
-- [ ] A tenant that uses up its monthly token quota is blocked until the quota resets
-- [ ] Concurrent requests do not let a tenant go over its quota
+- [x] A burst above a tenant's limit gets rejected while normal traffic passes
+- [x] A tenant that uses up its monthly token quota is blocked until the quota resets
+- [x] Concurrent requests do not let a tenant go over its quota
 
 **Write-up**
 - [ ] 30-minute note: what I built, what broke, what I'd change, one tradeoff

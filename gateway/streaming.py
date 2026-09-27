@@ -7,6 +7,7 @@
 # pay for, and (2) write the usage row, marking whether its counts are exact.
 
 import time
+from datetime import datetime
 
 import anyio
 import asyncpg
@@ -14,7 +15,7 @@ import httpx
 from starlette.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 
-from gateway import forwarding, metering
+from gateway import forwarding, limits, metering
 
 
 def is_event_stream(upstream: httpx.Response) -> bool:
@@ -31,15 +32,23 @@ class MeteredStream(StreamingResponse):
         self,
         upstream: httpx.Response,
         db: asyncpg.Pool,
+        limiter: limits.Limiter,
+        tenant_id: int,
         event_id: int,
         model: str | None,
         started: float,
+        started_at: datetime,
+        quota_hold: int,
     ) -> None:
         self.upstream = upstream
         self.db = db
+        self.limiter = limiter
+        self.tenant_id = tenant_id
         self.event_id = event_id
         self.model = model
         self.started = started
+        self.started_at = started_at
+        self.quota_hold = quota_hold
         self.meter = metering.StreamUsage()
         self.upstream_done = False    # we read the provider's stream to the end
         self.upstream_failed = False  # the provider's connection broke midway
@@ -84,7 +93,7 @@ class MeteredStream(StreamingResponse):
                 # generating, so a caller who leaves stops costing money.
                 await self.upstream.aclose()
                 input_tokens, output_tokens = self.meter.usage()
-                await metering.finish(
+                tokens = await metering.finish(
                     self.db,
                     self.event_id,
                     self.model,
@@ -94,4 +103,9 @@ class MeteredStream(StreamingResponse):
                     output_tokens,
                     self.meter.provider_cost,
                     self._outcome(),
+                )
+                # Estimated tokens count too: a disconnect mustn't be a way
+                # around the quota any more than around billing.
+                await self.limiter.settle(
+                    self.tenant_id, self.started_at, self.quota_hold, tokens
                 )

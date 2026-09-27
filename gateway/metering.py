@@ -8,6 +8,7 @@
 
 import json
 import logging
+from datetime import datetime
 from decimal import Decimal
 
 import asyncpg
@@ -26,11 +27,21 @@ PRICES_PER_MTOK = {
 MILLION = Decimal(1_000_000)
 
 
-async def start(pool: asyncpg.Pool, tenant_id: int, model: str | None) -> int:
+async def start(
+    pool: asyncpg.Pool, tenant_id: int, model: str | None, started_at: datetime, quota_hold: int
+) -> int:
+    # created_at is the gateway's start time, not Postgres's now(): the quota
+    # uses the same value, so both agree on which month a call belongs to.
+    # quota_hold is stored so a Redis rebuild can count in-flight calls.
     return await pool.fetchval(
-        "INSERT INTO usage_events (tenant_id, model) VALUES ($1, $2) RETURNING id",
+        """
+        INSERT INTO usage_events (tenant_id, model, created_at, quota_hold)
+        VALUES ($1, $2, $3, $4) RETURNING id
+        """,
         tenant_id,
         model,
+        started_at,
+        quota_hold,
     )
 
 
@@ -143,10 +154,10 @@ async def finish_buffered(
     status_code: int,
     body: bytes,
     latency_ms: int,
-) -> None:
+) -> int:
     # A normal (non-streamed) reply: we read the whole body, so it's complete.
     input_tokens, output_tokens, provider_cost = read_usage(status_code, body)
-    await finish(
+    return await finish(
         pool, event_id, model, status_code, latency_ms,
         input_tokens, output_tokens, provider_cost, "complete",
     )
@@ -162,7 +173,8 @@ async def finish(
     output_tokens: int | None,
     provider_cost: Decimal | None,
     outcome: str,
-) -> None:
+) -> int:
+    """Writes the row; returns the call's total tokens, for the monthly quota."""
     try:
         await pool.execute(
             """
@@ -186,3 +198,4 @@ async def finish(
         # for. The row keeps status_code NULL, so this call still shows up as
         # "started, never finished".
         log.exception("metering: finishing usage_event %s failed", event_id)
+    return (input_tokens or 0) + (output_tokens or 0)
