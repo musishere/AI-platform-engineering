@@ -283,8 +283,8 @@ If not: the likely cause is coding rounds or too little production evidence, not
 
 ## Week 1 (Project 1, by day)
 
-- [ ] Day 1: Create the repo, set up FastAPI, add a `/health` endpoint
-- [ ] Day 2: Make `POST /v1/messages` forward a request to Claude and return the response
+- [x] Day 1: Create the repo, set up FastAPI, add a `/health` endpoint
+- [x] Day 2: Make `POST /v1/messages` forward a request to Claude and return the response
 - [ ] Day 3: Add a Postgres `tenants` table with hashed API keys, and reject unknown keys with a 401
 - [ ] Day 4: Add a `usage_events` table recording tokens, cost, and latency for every call
 - [ ] Day 5: Test it with a small client script and review the code
