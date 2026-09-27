@@ -8,6 +8,7 @@
 # Run locally: uv run --env-file .env uvicorn gateway.main:app --reload
 
 import os
+import time
 from contextlib import asynccontextmanager
 
 import asyncpg
@@ -15,7 +16,8 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from gateway import auth, forwarding
+from gateway import auth, forwarding, metering
+from gateway.db import DB_ERRORS
 
 
 @asynccontextmanager
@@ -59,7 +61,7 @@ async def messages(request: Request) -> Response:
         tenant_id = await auth.find_tenant_id(
             request.app.state.db, request.headers.get("x-api-key")
         )
-    except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError):
+    except DB_ERRORS:
         # Fail closed: if we can't check the key, nobody gets in. 503 says
         # "a service I depend on is down", so it's retryable, unlike a 401.
         return error_response(503, "api_error", "auth database unavailable")
@@ -69,24 +71,42 @@ async def messages(request: Request) -> Response:
         return error_response(401, "authentication_error", "invalid x-api-key")
 
     body = await request.body()
+    model = metering.requested_model(body)
+    try:
+        event_id = await metering.start(request.app.state.db, tenant_id, model)
+    except DB_ERRORS:
+        # Nothing has been spent yet, so refusing here is safe. Better than
+        # letting a call through that we'd have no record of.
+        return error_response(503, "api_error", "usage database unavailable")
+
+    # perf_counter is a monotonic clock: it only moves forward, unlike the
+    # wall clock, which can jump when the machine syncs its time.
+    started = time.perf_counter()
     try:
         upstream = await forwarding.forward_messages(
             request.app.state.upstream, body, request.headers
         )
+        # Pass the upstream answer through unchanged, errors included: a 400
+        # for a bad model name or a 429 rate limit is information the caller
+        # needs. ponytail: buffers the whole reply, so "stream": true arrives
+        # all at once; real streaming is Project 1's stretch goal.
+        response = Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type"),
+        )
     except httpx.TimeoutException:
         # 504 = "the server behind me was too slow". Distinct from 502 so the
         # caller (and later our dashboards) can tell slow from down.
-        return error_response(504, "api_error", "upstream timed out")
+        response = error_response(504, "api_error", "upstream timed out")
     except httpx.RequestError:
         # 502 = "the server behind me failed" (DNS, refused, reset...).
-        return error_response(502, "api_error", "upstream unreachable")
+        response = error_response(502, "api_error", "upstream unreachable")
+    latency_ms = round((time.perf_counter() - started) * 1000)
 
-    # Pass the upstream answer through unchanged, errors included: a 400 for
-    # a bad model name or a 429 rate limit is information the caller needs.
-    # ponytail: buffers the whole reply, so "stream": true arrives all at once;
-    # real streaming is Project 1's stretch goal.
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        media_type=upstream.headers.get("content-type"),
+    # Errors are metered too: "tenant X got 200 errors today" is exactly what
+    # a usage table should show.
+    await metering.finish(
+        request.app.state.db, event_id, model, response.status_code, response.body, latency_ms
     )
+    return response
