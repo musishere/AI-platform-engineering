@@ -33,10 +33,10 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 **Goal:** A FastAPI proxy in front of the Claude API that authenticates tenants and meters every call.
 
 **What to build**
-- [ ] FastAPI service that forwards requests to the Claude API
-- [ ] Per-tenant API keys, stored hashed
-- [ ] Usage metering into Postgres: tokens, cost, latency, status
-- [ ] Stretch: streaming with correct metering, including client disconnects
+- [x] FastAPI service that forwards requests to the Claude API
+- [x] Per-tenant API keys, stored hashed
+- [x] Usage metering into Postgres: tokens, cost, latency, status
+- [x] Stretch: streaming with correct metering, including client disconnects
 
 **What I'll learn**
 - Proxying HTTP requests asynchronously in FastAPI
@@ -46,9 +46,9 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 - (Stretch) Streaming responses, and metering when the client disconnects mid-stream
 
 **Done when**
-- [ ] A request with a valid tenant key returns Claude's response, and an unknown key returns 401
-- [ ] Every call writes one usage row with tokens, cost, latency and status
-- [ ] No plaintext API keys exist in the database
+- [x] A request with a valid tenant key returns Claude's response, and an unknown key returns 401
+- [x] Every call writes one usage row with tokens, cost, latency and status
+- [x] No plaintext API keys exist in the database
 
 **Write-up**
 - [ ] 30-minute note: what I built, what broke, what I'd change, one tradeoff
@@ -287,4 +287,4 @@ If not: the likely cause is coding rounds or too little production evidence, not
 - [x] Day 2: Make `POST /v1/messages` forward a request to Claude and return the response
 - [x] Day 3: Add a Postgres `tenants` table with hashed API keys, and reject unknown keys with a 401
 - [x] Day 4: Add a `usage_events` table recording tokens, cost, and latency for every call
-- [ ] Day 5: Test it with a small client script and review the code
+- [x] Day 5: Test it with a small client script and review the code

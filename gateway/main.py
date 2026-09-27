@@ -7,6 +7,7 @@
 #
 # Run locally: uv run --env-file .env uvicorn gateway.main:app --reload
 
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -16,7 +17,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from gateway import auth, forwarding, metering
+from gateway import auth, forwarding, metering, streaming
 from gateway.db import DB_ERRORS
 
 
@@ -42,6 +43,38 @@ def error_response(status: int, error_type: str, message: str) -> JSONResponse:
         status_code=status,
         content={"type": "error", "error": {"type": error_type, "message": message}},
     )
+
+
+# Same cap as Claude's own API. Without one, a single tenant sending a huge
+# body could exhaust the gateway's memory and take every tenant down.
+MAX_BODY_BYTES = 32 * 1024 * 1024
+
+
+async def read_body_limited(request: Request) -> bytes | None:
+    # Returns None when the body is too large.
+    # Cheap early exit when the caller declares its size up front...
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        return None
+    # ...but count while reading anyway, because a body can arrive without a
+    # declared size (chunked upload).
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_BODY_BYTES:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def parse_json_object(body: bytes) -> dict:
+    # Peek at a few fields (model, stream) without changing what we forward.
+    # Invalid JSON gives {}: the upstream will reject it with a proper 400.
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 @app.get("/health")
@@ -70,8 +103,15 @@ async def messages(request: Request) -> Response:
         # would help an attacker probe which keys exist.
         return error_response(401, "authentication_error", "invalid x-api-key")
 
-    body = await request.body()
-    model = metering.requested_model(body)
+    body = await read_body_limited(request)
+    if body is None:
+        return error_response(413, "request_too_large", "request body exceeds 32 MB")
+
+    payload = parse_json_object(body)
+    model = payload.get("model")
+    if not isinstance(model, str):
+        model = None
+
     try:
         event_id = await metering.start(request.app.state.db, tenant_id, model)
     except DB_ERRORS:
@@ -83,16 +123,30 @@ async def messages(request: Request) -> Response:
     # wall clock, which can jump when the machine syncs its time.
     started = time.perf_counter()
     try:
-        upstream = await forwarding.forward_messages(
-            request.app.state.upstream, body, request.headers
-        )
+        if payload.get("stream"):
+            upstream = await forwarding.open_stream(
+                request.app.state.upstream, body, request.headers
+            )
+            if streaming.is_event_stream(upstream):
+                # From here the stream relays itself and writes the usage
+                # row when it ends, however it ends.
+                return streaming.MeteredStream(
+                    upstream, request.app.state.db, event_id, model, started
+                )
+            # Not a stream after all (e.g. a 400 sent up front): read it
+            # whole and handle it exactly like a normal reply below.
+            await upstream.aread()
+        else:
+            upstream = await forwarding.forward_messages(
+                request.app.state.upstream, body, request.headers
+            )
         # Pass the upstream answer through unchanged, errors included: a 400
         # for a bad model name or a 429 rate limit is information the caller
-        # needs. ponytail: buffers the whole reply, so "stream": true arrives
-        # all at once; real streaming is Project 1's stretch goal.
+        # needs.
         response = Response(
             content=upstream.content,
             status_code=upstream.status_code,
+            headers=forwarding.response_headers(upstream),
             media_type=upstream.headers.get("content-type"),
         )
     except httpx.TimeoutException:
@@ -106,7 +160,7 @@ async def messages(request: Request) -> Response:
 
     # Errors are metered too: "tenant X got 200 errors today" is exactly what
     # a usage table should show.
-    await metering.finish(
+    await metering.finish_buffered(
         request.app.state.db, event_id, model, response.status_code, response.body, latency_ms
     )
     return response

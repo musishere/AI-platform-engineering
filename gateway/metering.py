@@ -26,15 +26,6 @@ PRICES_PER_MTOK = {
 MILLION = Decimal(1_000_000)
 
 
-def requested_model(body: bytes) -> str | None:
-    # Read only the model name; the body itself is still forwarded untouched.
-    try:
-        model = json.loads(body).get("model")
-    except (ValueError, AttributeError):
-        return None
-    return model if isinstance(model, str) else None
-
-
 async def start(pool: asyncpg.Pool, tenant_id: int, model: str | None) -> int:
     return await pool.fetchval(
         "INSERT INTO usage_events (tenant_id, model) VALUES ($1, $2) RETURNING id",
@@ -75,7 +66,77 @@ def compute_cost(model: str | None, input_tokens: int | None, output_tokens: int
     return (input_tokens * input_price + output_tokens * output_price) / MILLION
 
 
-async def finish(
+class StreamUsage:
+    """Reads the token counts out of a streamed (SSE) reply as it passes by.
+
+    A streamed reply is a series of events. input_tokens arrives first
+    (message_start), the final output_tokens near the end (message_delta).
+    We only look; the bytes go to the caller unchanged.
+    """
+
+    # Rough rule for English text: ~4 characters per token. Only used when
+    # the final count never arrived (caller left, or the stream broke).
+    CHARS_PER_TOKEN = 4
+
+    def __init__(self) -> None:
+        self.input_tokens: int | None = None
+        self.output_tokens: int | None = None
+        self.provider_cost: Decimal | None = None
+        self.final_usage_seen = False  # message_delta arrived: output count is exact
+        self.stopped = False           # message_stop arrived: the stream ended normally
+        self.errored = False           # the provider sent an error event mid-stream
+        self.chars_delivered = 0       # for the estimate if the final count never comes
+        self._partial_line = b""
+
+    def feed(self, chunk: bytes) -> None:
+        # Chunks don't line up with events: one event can be split across two
+        # chunks. Keep the unfinished last line until the rest arrives.
+        lines = (self._partial_line + chunk).split(b"\n")
+        self._partial_line = lines.pop()
+        for line in lines:
+            if line.startswith(b"data:"):
+                self._read_event(line[5:].strip())
+
+    def _read_event(self, data: bytes) -> None:
+        try:
+            event = json.loads(data)
+            kind = event.get("type")
+            if kind == "message_start":
+                usage = event["message"]["usage"]
+                self.input_tokens = usage.get("input_tokens")
+                self.output_tokens = usage.get("output_tokens")
+            elif kind == "content_block_delta":
+                delta = event["delta"]
+                # text for answers, partial_json for tool calls, thinking for reasoning
+                for field in ("text", "partial_json", "thinking"):
+                    self.chars_delivered += len(delta.get(field) or "")
+            elif kind == "message_delta":
+                usage = event["usage"]
+                self.output_tokens = usage["output_tokens"]
+                self.final_usage_seen = True
+                # Newer API versions repeat the input count here; take it if so.
+                self.input_tokens = usage.get("input_tokens", self.input_tokens)
+                if usage.get("cost") is not None:
+                    self.provider_cost = Decimal(str(usage["cost"]))
+            elif kind == "message_stop":
+                self.stopped = True
+            elif kind == "error":
+                self.errored = True
+        except (ValueError, KeyError, TypeError, AttributeError):
+            # One unreadable event must never break the caller's stream.
+            pass
+
+    def usage(self) -> tuple[int | None, int | None]:
+        if self.final_usage_seen:
+            return self.input_tokens, self.output_tokens
+        # The final count never came. Estimate from what we delivered, rounded
+        # up, rather than record nothing: NULL would let a tenant get output
+        # tokens free by disconnecting just before the end.
+        estimate = -(-self.chars_delivered // self.CHARS_PER_TOKEN)  # ceiling division
+        return self.input_tokens, max(self.output_tokens or 0, estimate)
+
+
+async def finish_buffered(
     pool: asyncpg.Pool,
     event_id: int,
     model: str | None,
@@ -83,13 +144,32 @@ async def finish(
     body: bytes,
     latency_ms: int,
 ) -> None:
+    # A normal (non-streamed) reply: we read the whole body, so it's complete.
     input_tokens, output_tokens, provider_cost = read_usage(status_code, body)
+    await finish(
+        pool, event_id, model, status_code, latency_ms,
+        input_tokens, output_tokens, provider_cost, "complete",
+    )
+
+
+async def finish(
+    pool: asyncpg.Pool,
+    event_id: int,
+    model: str | None,
+    status_code: int,
+    latency_ms: int,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    provider_cost: Decimal | None,
+    outcome: str,
+) -> None:
     try:
         await pool.execute(
             """
             UPDATE usage_events
             SET status_code = $2, input_tokens = $3, output_tokens = $4,
-                cost_usd = $5, provider_cost_usd = $6, latency_ms = $7
+                cost_usd = $5, provider_cost_usd = $6, latency_ms = $7,
+                outcome = $8
             WHERE id = $1
             """,
             event_id,
@@ -99,6 +179,7 @@ async def finish(
             compute_cost(model, input_tokens, output_tokens),
             provider_cost,
             latency_ms,
+            outcome,
         )
     except DB_ERRORS:
         # Fail open: the money is spent and the caller should get what it paid
