@@ -3,3 +3,13 @@ __pycache__/
 .DS_Store
 # Secrets (Claude API key, DB password) will live here. Never commit them.
 .env
+# Terraform: working dirs and state never go in git (state lives in OCI).
+# *.tfvars holds the account ID and alert email. .terraform.lock.hcl IS
+# committed, so every run uses the same provider versions.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+# Saved plans can contain account details.
+tfplan

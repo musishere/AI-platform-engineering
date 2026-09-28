@@ -19,7 +19,7 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 |-------|---------|---------|
 | 1 | 1. LLM gateway | FastAPI proxy to Claude with per-tenant keys and usage metering in Postgres |
 | 1–2 | 2. Quotas and rate limits | Redis token bucket and monthly token quotas enforced per tenant |
-| 2 | 3. Deploy it properly | Gateway on EKS via Terraform and Argo CD, with a CI/CD canary pipeline |
+| 2 | 3. Deploy it properly | Gateway on OKE (Oracle Cloud) via Terraform and Argo CD, with a CI/CD canary pipeline |
 | 3 | 4. Monitoring | Metrics, traces, SLOs and burn-rate alerts for the gateway |
 | 3–4 | 5. Self-hosted model | vLLM on a rented GPU, benchmarked across concurrency and quantization |
 | 4–5 | 6. Gateway v2 | Cost/task routing between Claude and vLLM with fallback, plus a published benchmark post |
@@ -83,11 +83,13 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 
 **Goal:** Run the gateway on infrastructure I designed myself, not just deployed onto.
 
+**Cloud:** Oracle Cloud (OCI), home region Mumbai (`ap-mumbai-1`), in place of AWS. Always Free resources only, except Workload Identity, which needs an enhanced cluster and must be done within the $300 / 30-day trial (ends ~2026-10-28). Build, test, destroy each session.
+
 **What to build**
-- [ ] Terraform: VPC
-- [ ] Terraform: EKS cluster
-- [ ] Terraform: IRSA for pod-level AWS permissions
-- [ ] Terraform: remote state
+- [x] Terraform: remote state (Object Storage), done first so no paid resource is ever tracked only on my laptop
+- [ ] Terraform: VCN (OCI's VPC)
+- [ ] Terraform: OKE cluster (OCI's EKS)
+- [ ] Terraform: OKE Workload Identity for pod-level OCI permissions (OCI's IRSA)
 - [ ] Argo CD deploying the gateway
 - [ ] CI/CD pipeline: build
 - [ ] CI/CD pipeline: scan
@@ -95,16 +97,16 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 - [ ] CI/CD pipeline: canary release
 
 **What I'll learn**
-- VPC layout (subnets, routing) for an EKS cluster
-- IAM roles for service accounts (IRSA)
+- VCN layout (subnets, routing) for an OKE cluster
+- Workload Identity for pods (OCI's IRSA)
 - Terraform remote state and how to structure modules
 - GitOps with Argo CD
 - Canary rollouts and when to roll back
 
 **Done when**
-- [ ] `terraform apply` from scratch brings up the VPC and EKS cluster, with state stored remotely
+- [ ] `terraform apply` from scratch brings up the VCN and OKE cluster, with state stored remotely
 - [ ] A merge to main builds, scans and pushes an image, and Argo CD rolls it out as a canary
-- [ ] The gateway pod reaches AWS through IRSA, with no static credentials
+- [ ] The gateway pod reaches OCI through Workload Identity, with no static credentials
 
 **Write-up**
 - [ ] 30-minute note: what I built, what broke, what I'd change, one tradeoff
