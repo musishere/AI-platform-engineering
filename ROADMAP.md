@@ -87,7 +87,7 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 
 **What to build**
 - [x] Terraform: remote state (Object Storage), done first so no paid resource is ever tracked only on my laptop
-- [ ] Terraform: VCN (OCI's VPC)
+- [x] Terraform: VCN (OCI's VPC)
 - [ ] Terraform: OKE cluster (OCI's EKS)
 - [ ] Terraform: OKE Workload Identity for pod-level OCI permissions (OCI's IRSA)
 - [ ] Argo CD deploying the gateway
