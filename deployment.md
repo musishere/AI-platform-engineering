@@ -1,6 +1,6 @@
 # Deployment: how the gateway runs on Kubernetes
 
-> **Status (2026-09-29):** Steps 1–3 done: Argo CD deploys `k8s/` from `main` onto minikube (auto-sync, prune, selfHeal), and a real call was metered end to end. Step 4 (CI: build, scan, push) is next.
+> **Status (2026-09-29):** Steps 1–3 done: Argo CD deploys `k8s/` from `main` onto minikube (auto-sync, prune, selfHeal), and a real call was metered end to end. Step 4 done: a push to `main` builds, Trivy-scans and pushes `ghcr.io/…/gateway:<sha>`, CI commits the tag into `k8s/gateway.yaml`, and Argo CD rolls it out (first run 2026-09-29, ~5 min push → new pods). Step 5 (canary) is next.
 > The OKE deploy is paused until funded, so everything below runs on **minikube on my Mac, for $0**.
 > Moving to OKE later changes the "outside" of this picture, not the inside (see section 9).
 

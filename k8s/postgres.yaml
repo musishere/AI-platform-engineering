@@ -74,6 +74,10 @@ spec:
             exec:
               command: [pg_isready, -U, gateway, -d, gateway]
             periodSeconds: 5
+            # The default is 1s, which a busy node (e.g. pulling a new image)
+            # blew through: Postgres flapped "not ready", dropped out of the
+            # Service, and gateways got connection refused. 5s rides that out.
+            timeoutSeconds: 5
           resources:
             requests:
               cpu: 100m

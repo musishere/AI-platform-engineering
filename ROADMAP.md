@@ -93,9 +93,9 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 - [ ] Terraform: OKE cluster (OCI's EKS)
 - [ ] Terraform: OKE Workload Identity for pod-level OCI permissions (OCI's IRSA)
 - [x] Argo CD deploying the gateway
-- [ ] CI/CD pipeline: build
-- [ ] CI/CD pipeline: scan
-- [ ] CI/CD pipeline: push
+- [x] CI/CD pipeline: build
+- [x] CI/CD pipeline: scan
+- [x] CI/CD pipeline: push
 - [ ] CI/CD pipeline: canary release
 
 **What I'll learn**
