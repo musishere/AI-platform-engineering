@@ -1,16 +1,42 @@
 # The LLM gateway itself (the image built from Dockerfile).
 #
-# Two replicas behind one Service: one pod can be replaced while the other
-# keeps serving, and the canary (step 5) needs pods to split traffic across.
+# A Rollout (Argo Rollouts), not a Deployment: same pod template, but a new
+# image goes out as a canary. A slice of traffic first, a smoke test, then
+# the rest, with an automatic rollback if the smoke test fails. A plain
+# Deployment would roll to 100% as long as /health answers, bug or not.
+#
 # Extra copies are safe because the gateway keeps no state in memory:
 # everything lives in Postgres and Redis.
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
 metadata:
   name: gateway
   namespace: llm-gateway
 spec:
-  replicas: 2
+  # 4, not 2: without a traffic router, the split IS the pod count (the
+  # Service picks pods at random), so 4 pods give 25% steps. 2 pods could
+  # only do 50%, which isn't much of a canary.
+  replicas: 4
+  strategy:
+    canary:
+      # Rollouts points this Service at the canary pods only, so the smoke
+      # test hits the NEW version, never the stable one.
+      canaryService: gateway-canary
+      # ponytail: split is per connection, not per request (a client that
+      # keeps its connection open sticks to one version). Add an ingress
+      # with weights (trafficRouting) for exact or tiny (1%) percentages.
+      steps:
+        - setWeight: 25   # 1 of 4 pods is the new version
+        - analysis:       # smoke test (k8s/gateway-smoke.yaml); fail = abort
+            templates:
+              - templateName: gateway-smoke
+        # Soak time: problems that don't show in one request (a slow memory
+        # leak, a crash after the first minute) get a chance to appear while
+        # only a quarter of traffic is exposed.
+        - pause: {duration: 2m}
+        - setWeight: 50
+        - pause: {duration: 2m}
+        # After the last step: 100%, and the old pods are removed.
   selector:
     matchLabels:
       app: gateway
@@ -78,13 +104,29 @@ spec:
             limits:
               memory: 256Mi
 ---
-# One stable address for both gateway pods. ClusterIP = reachable only
+# One stable address for ALL gateway pods, stable and canary alike: that's
+# what makes the pod-count split work. ClusterIP = reachable only
 # inside the cluster; from the Mac I use `kubectl port-forward`. On OKE this
 # becomes a LoadBalancer (or Ingress) in the public LB subnet.
 apiVersion: v1
 kind: Service
 metadata:
   name: gateway
+  namespace: llm-gateway
+spec:
+  selector:
+    app: gateway
+  ports:
+    - port: 80
+      targetPort: 8000
+---
+# The canary's own address, used only by the smoke test. Rollouts adds the
+# canary's pod-template hash to this selector during a rollout, so it
+# matches only the new pods. Callers never use it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-canary
   namespace: llm-gateway
 spec:
   selector:

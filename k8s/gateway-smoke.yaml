@@ -1,0 +1,51 @@
+# Canary smoke test: the check that decides whether a new gateway version
+# gets more traffic or gets rolled back.
+#
+# Run by the Rollout (k8s/gateway.yaml) at the 25% step, as a one-off Job
+# against the gateway-canary Service, i.e. only the NEW pods. It sends a
+# request with a fake API key and expects 401. A 401 proves a lot for $0:
+# the new code started, parses requests, and reached Postgres to look the
+# key up. It never reaches Claude (auth rejects it first) and writes no usage
+# row. A 503 (Postgres unreachable) or a 500 (a bug) fails the Job, which
+# fails the analysis, which aborts the rollout: traffic returns to stable.
+#
+# Its own file, not gateway.yaml: CI rewrites every `image:` line in
+# gateway.yaml with the new gateway tag, and would overwrite curl's.
+#
+# ponytail: proves "up and wired to Postgres", not "healthy under real
+# traffic". Project 4 swaps this for a Prometheus error-rate check.
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: gateway-smoke
+  namespace: llm-gateway
+spec:
+  metrics:
+    - name: fake-key-gets-401
+      provider:
+        job:
+          spec:
+            # One attempt, no retries: a flaky canary should fail, not pass
+            # on its third try. The script already tries 5 requests.
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: smoke
+                    image: curlimages/curl:8.22.0
+                    # 5 requests, all must be 401. More than one, so a
+                    # canary that fails only sometimes still gets caught.
+                    command:
+                      - sh
+                      - -c
+                      - |
+                        for i in 1 2 3 4 5; do
+                          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+                            -X POST http://gateway-canary/v1/messages \
+                            -H 'x-api-key: gw_smoke_test_not_a_real_key' \
+                            -H 'content-type: application/json' -d '{}')
+                          echo "request $i: HTTP $code"
+                          [ "$code" = 401 ] || { echo "FAIL: expected 401"; exit 1; }
+                        done
+                        echo "PASS"

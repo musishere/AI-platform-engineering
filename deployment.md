@@ -292,11 +292,11 @@ over the CPU limit just slows it down. Small values on purpose, because everythi
 |---|---|---|
 | `Pending` | Not enough CPU/memory left on the node | `kubectl describe pod …` → Events: `Insufficient memory` |
 | `ErrImagePull` / `ImagePullBackOff` | Image not loaded into minikube, or wrong tag | `minikube image ls \| grep gateway` |
-| `CrashLoopBackOff` (gateway) | Missing env var (`KeyError: 'UPSTREAM_API_KEY'`) or DB unreachable at startup | `kubectl logs deploy/gateway` |
+| `CrashLoopBackOff` (gateway) | Missing env var (`KeyError: 'UPSTREAM_API_KEY'`) or DB unreachable at startup | `kubectl logs -n llm-gateway -l app=gateway --prefix` |
 | `CreateContainerConfigError` | Secret `gateway-secrets` doesn't exist yet | `kubectl get secret -n llm-gateway` |
 | `OOMKilled` in `describe` | Memory limit too low | Raise the limit, or find the leak |
 | Tables missing | `db-init` didn't run because the volume already had data | `kubectl exec deploy/postgres -- psql -U gateway -c '\dt'` |
-| Code change not live | Same `:dev` tag, so no rollout | `kubectl rollout restart deploy/gateway` |
+| Code change not live | Same `:dev` tag, so no rollout | Restart the Rollout (section 10) |
 | 401 on every call | New database = no tenants yet | Create a tenant inside the cluster (section 10) |
 
 ---
@@ -340,7 +340,7 @@ minikube start --driver=docker --cpus=4 --memory=5g
 minikube stop                                    # free the RAM when done; the cluster is kept
 
 # Image: CI builds and pushes it on every merge to main (step 4). By hand only
-# to try something before pushing (then `kubectl rollout restart deploy/gateway`):
+# to try something before pushing (then restart the Rollout, see below):
 docker build -t gateway:dev .
 minikube image load gateway:dev
 
@@ -361,12 +361,20 @@ kubectl create secret generic gateway-secrets -n llm-gateway \
 # Deploy + look
 kubectl apply -f k8s/
 kubectl get pods -n llm-gateway -w
-kubectl logs -n llm-gateway deploy/gateway -f
+kubectl logs -n llm-gateway -l app=gateway --prefix -f   # all gateway pods
 kubectl describe pod -n llm-gateway <pod>        # the "Events" section explains most failures
 
 # Use it
 kubectl port-forward -n llm-gateway svc/gateway 8000:80
-kubectl exec -n llm-gateway deploy/gateway -- python -m gateway.create_tenant acme
+kubectl exec -n llm-gateway svc/gateway -- python -m gateway.create_tenant acme
+
+# Canary (the gateway is an Argo Rollout, not a Deployment, since step 5)
+kubectl get rollout gateway -n llm-gateway -w       # phase: Progressing / Paused / Healthy / Degraded
+kubectl describe rollout gateway -n llm-gateway     # current step, canary vs stable, why it aborted
+kubectl get analysisrun,job -n llm-gateway          # smoke tests and their Jobs
+kubectl logs -n llm-gateway job/<smoke-job>         # the 5 requests and PASS/FAIL
+# Restart all gateway pods (the Rollout's version of `rollout restart`)
+kubectl patch rollout gateway -n llm-gateway --type merge -p "{\"spec\":{\"restartAt\":\"$(date -u +%FT%TZ)\"}}"
 
 # Clean slate (deletes the Postgres data too)
 kubectl delete namespace llm-gateway
@@ -644,7 +652,7 @@ built in `infra/cluster/network.tf`: out only, nothing can call in.
 **Env vars are copied in when the container starts, and then frozen.**
 If Argo CD updates `gateway-config` (say a new `UPSTREAM_BASE_URL`), the **running pods keep the old value**.
 The ConfigMap changed, but the pod template didn't, so there's no new ReplicaSet and no rollout.
-Fix now: `kubectl rollout restart deploy/gateway`. Proper fix later: Kustomize's `configMapGenerator`
+Fix now: restart the Rollout (section 10). Proper fix later: Kustomize's `configMapGenerator`
 adds a content hash to the ConfigMap's name, so a change produces a new name, which changes the pod
 template and triggers a rollout automatically.
 
@@ -803,6 +811,9 @@ minikube start --driver=docker --cpus=4 --memory=5g
 # 3. Argo CD itself (pinned version)
 kubectl create namespace argocd
 kubectl apply -n argocd --server-side -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.3/manifests/install.yaml
+# 3b. Argo Rollouts (canary controller, pinned; --server-side for the same CRD-size reason)
+kubectl create namespace argo-rollouts
+kubectl apply -n argo-rollouts --server-side -f https://github.com/argoproj/argo-rollouts/releases/download/v1.10.0/install.yaml
 # 4. Secrets (never in Git): the repo key for Argo CD, the app secrets (section 10)
 kubectl create secret generic repo-ai-platform -n argocd --from-literal=type=git \
   --from-literal=url=git@github.com:musishere/AI-platform-engineering.git \

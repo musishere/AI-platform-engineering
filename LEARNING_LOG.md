@@ -23,3 +23,9 @@
 - **Learned:** Terraform plan → apply → destroy and state; remote state between folders; new-compartment permissions take minutes to spread (flickering 404s, so wait for N successes in a row); "not found" can mean "not allowed"; NAT = out only; the Kubernetes API endpoint is the cluster's control desk, not a gateway.
 - **Broke:** worker nodes never started: Mumbai OUT_OF_HOST_CAPACITY for free ARM (and even the free AMD micro), confirmed with a capacity report. Also misread the session expiry (local time, not UTC), so a destroy and watcher failed on an expired login.
 - **Next:** wait for free ARM capacity (watcher running), then rebuild the cluster and check `kubectl get nodes`. Everything in `infra/cluster` destroyed; only bootstrap left (free).
+
+## 2026-09-29: Project 3, CI (build, scan, push) + technical.md
+- **Built:** `technical.md` (whole-project deep reference). GitHub Actions pipeline: build → Trivy scan (fail on fixable HIGH/CRITICAL, before push) → push `ghcr.io/…/gateway:<sha>` → CI commits the tag into `k8s/gateway.yaml` → Argo CD rolls it out. Private GHCR image pulled via a read-only `ghcr-pull` Secret. First run: push → new pods in ~5 min.
+- **Learned:** CI builds artifacts, Argo CD only deploys manifests (code is invisible to it; the tag commit is the link); unique SHA tags make `IfNotPresent` safe; GITHUB_TOKEN commits don't trigger workflows (no loop); `paths` filter means k8s-only changes skip CI; Argo CD polls every ~3 min; secrets never go through chat (leaked PAT → revoked).
+- **Broke:** new gateway pod crashed once at startup: Postgres's exec readiness probe used the 1s default timeout, flapped under node load (68× in 5h), dropped out of the Service → connection refused. Fixed with `timeoutSeconds: 5` on Postgres and Redis probes.
+- **Next:** verify quota rebuild after the Redis restart with a real call, then canary release (Argo Rollouts).
