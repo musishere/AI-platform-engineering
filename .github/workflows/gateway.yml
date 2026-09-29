@@ -1,0 +1,101 @@
+# CI for the gateway: build -> scan -> push -> tell Argo CD.
+#
+# The factory line between my code and the cluster. On a push to main it
+# builds the image, refuses to ship it if Trivy finds a fixable HIGH/CRITICAL
+# vulnerability, pushes it to GHCR tagged with the commit SHA, and commits
+# that tag into k8s/gateway.yaml. Argo CD watches k8s/, so that commit IS the
+# deploy. CI never touches the cluster itself (no cluster credentials here).
+#
+# Pull requests run build + scan only, so a bad dependency is caught before
+# merge, and nothing unreviewed reaches the registry.
+
+name: gateway
+
+on:
+  push:
+    branches: [main]
+    # Only when the image's contents can change. A k8s/-only change is a
+    # config change Argo CD applies on its own; rebuilding would be waste.
+    paths:
+      - gateway/**
+      - Dockerfile
+      - .dockerignore
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/gateway.yml
+  pull_request:
+    paths:
+      - gateway/**
+      - Dockerfile
+      - .dockerignore
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/gateway.yml
+
+# Two merges close together must not race: both would try to commit a tag,
+# and the older one could land last and roll the cluster BACK. Queue instead
+# of cancelling, so every merged commit still gets built and scanned.
+concurrency:
+  group: gateway-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # GHCR needs lowercase names; github.repository keeps my repo's capitals
+  # ("AI-platform-engineering"), so the name is spelled out.
+  IMAGE: ghcr.io/musishere/ai-platform-engineering/gateway
+
+jobs:
+  build-scan-push:
+    runs-on: ubuntu-latest
+    # Least privilege: write to the repo (the tag commit) and to packages
+    # (GHCR push). Nothing else. The token dies when the job ends.
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        # amd64 only: minikube on my Intel Mac. OKE's free workers are ARM,
+        # so add linux/arm64 (buildx + QEMU, slower) when OKE happens.
+        # ponytail: no layer cache between runs, ~1 min per build; add
+        # buildx with cache-to/from type=gha if builds get slow.
+        run: docker build -t "$IMAGE:$GITHUB_SHA" .
+
+      - name: Scan
+        # Trivy as a container, same command as on my laptop. It reads the
+        # image straight from this runner's Docker engine via the socket.
+        #   --exit-code 1     a finding fails the job, so nothing ships
+        #   HIGH,CRITICAL     lower severities are reported, not blocking
+        #   --ignore-unfixed  a CVE with no fixed version yet can't be acted
+        #                     on; blocking on it would stop every deploy
+        run: >
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+          aquasec/trivy:0.74.0 image
+          --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed
+          "$IMAGE:$GITHUB_SHA"
+
+      # Everything below runs only for main. Scan happens BEFORE push, so a
+      # vulnerable image never reaches the registry at all.
+      - name: Push
+        if: github.event_name == 'push'
+        # Pushes the exact image that was scanned, not a rebuild of it:
+        # what runs in the cluster is byte-for-byte what Trivy checked.
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:$GITHUB_SHA"
+
+      - name: Deploy (commit the new tag)
+        if: github.event_name == 'push'
+        # A new SHA changes the Deployment's pod template, which is what
+        # makes Kubernetes roll out. A reused tag (like :dev) changes nothing.
+        # No loop: GitHub never starts workflows from commits pushed with
+        # GITHUB_TOKEN, and this commit only touches k8s/ anyway.
+        run: |
+          sed -i -E "s|^(\s*image:\s*).*$|\1$IMAGE:$GITHUB_SHA|" k8s/gateway.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "deploy: gateway ${GITHUB_SHA::7}"
+          # Someone may have pushed to main during the build; replay on top.
+          git pull --rebase origin main
+          git push origin HEAD:main

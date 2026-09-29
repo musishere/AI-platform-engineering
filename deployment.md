@@ -1,12 +1,15 @@
 # Deployment: how the gateway runs on Kubernetes
 
-> **Status (2026-09-29):** Steps 1–2 done: the gateway runs on minikube from `k8s/` and a real call was metered end to end. Step 3 (Argo CD) is next.
+> **Status (2026-09-29):** Steps 1–3 done: Argo CD deploys `k8s/` from `main` onto minikube (auto-sync, prune, selfHeal), and a real call was metered end to end. Step 4 (CI: build, scan, push) is next.
 > The OKE deploy is paused until funded, so everything below runs on **minikube on my Mac, for $0**.
 > Moving to OKE later changes the "outside" of this picture, not the inside (see section 9).
 
 **One-sentence version:** my gateway code is packed into an **image**, Kubernetes runs **2 copies** of it
 next to a **Postgres** and a **Redis**, and a **Service** gives them one stable address. Later, Git becomes
 the single source of truth: CI builds the image and Argo CD makes the cluster match what Git says.
+
+**How to read this:** Part 1 (sections 1–12) is the **map**: what exists and why. Part 2 (sections 13–22)
+is **under the hood**: what actually happens, step by step, with real output from my cluster.
 
 ---
 
@@ -336,9 +339,15 @@ colima start --cpu 4 --memory 6                  # the Linux VM (Docker engine)
 minikube start --driver=docker --cpus=4 --memory=5g
 minikube stop                                    # free the RAM when done; the cluster is kept
 
-# Image
+# Image: CI builds and pushes it on every merge to main (step 4). By hand only
+# to try something before pushing (then `kubectl rollout restart deploy/gateway`):
 docker build -t gateway:dev .
 minikube image load gateway:dev
+
+# GHCR pull secret (once per cluster; never committed). The token is a GitHub
+# classic PAT with ONLY read:packages: it can pull images, nothing else.
+kubectl create secret docker-registry ghcr-pull -n llm-gateway \
+  --docker-server=ghcr.io --docker-username=musishere --docker-password=<PAT>
 
 # Secret (once per cluster, from .env; never committed)
 # New random DB password each fresh cluster; the API key is copied from .env.
@@ -421,3 +430,425 @@ someone else controls production. Pull also catches drift. See section 4.
 | Robot that makes the cluster match Git | Argo CD (GitOps) | Pull-based continuous delivery with drift detection |
 | Taste-test before serving everyone | Canary release | Send a small % of traffic to the new version, then expand or abort |
 | Folder for related things | Namespace | A name scope + a unit for cleanup and permissions |
+
+---
+---
+
+# Part 2: Under the hood
+
+## 13. The one idea behind everything: "desired state" + a loop that fixes differences
+
+🟢 **In simple words:** a thermostat. You don't tell the heater "turn on for 20 minutes." You say
+"I want 22°C." The thermostat keeps checking the room and switches the heater on or off until the room
+matches. If someone opens a window, it notices and fixes it again. It never "finishes."
+
+🔵 **Technically:** this is a **control loop** (also called **reconciliation**): *observe actual state →
+compare with desired state → act on the difference → repeat forever*. Kubernetes is dozens of these loops.
+Argo CD is one more loop stacked on top, with Git as its "thermostat setting."
+
+```
+ WHAT I WANT                                      WHAT ACTUALLY RUNS
+ ───────────                                      ──────────────────
+ Git: k8s/*.yaml ──(Argo CD loop)──▶ API server/etcd ──(Kubernetes loops)──▶ pods & containers
+   "2 gateways"     compares Git      "2 gateways"      Deployment ctrl,      2 real processes
+                    vs cluster,       (desired state    ReplicaSet ctrl,      on the node
+                    applies diff       stored here)     scheduler, kubelet
+
+   loop 1: Git ↔ cluster (Argo CD)   loop 2: object ↔ pods (controllers)   loop 3: pod ↔ container (kubelet)
+```
+
+Once this idea clicks, everything else is a detail:
+- **The 4 restarts**: kubelet's loop kept trying to make "a running gateway container" true.
+- **The self-heal test**: I changed the middle box by hand, and Argo CD's loop made it match Git again.
+- **Scaling**: I never "start a pod." I change a number and the loops make it true.
+
+**Why this matters (interview line):** imperative = "do these steps" (breaks if one step fails halfway).
+Declarative = "this is the end state" (the loops retry until it's true, and repair drift later).
+
+---
+
+## 14. Layer 1: the image, under the hood
+
+### What `docker build -t gateway:dev .` really did
+
+```
+ 1. Build context      the "." folder is sent to the Docker engine (inside Colima)
+                       MINUS everything in .dockerignore (.env, .venv, .git, infra …)
+                                          │
+ 2. Stage "build"      python:3.12-slim + uv binary
+                       COPY pyproject.toml uv.lock   ← only the lock files
+                       RUN uv sync --frozen          ← creates /app/.venv
+                                          │
+ 3. Stage 2 (final)    fresh python:3.12-slim
+                       useradd app (uid 10001)
+                       COPY --from=build /app/.venv  ← only the result crosses over
+                       COPY gateway/
+                       USER 10001, CMD uvicorn …
+                                          │
+ 4. Tag                that final stack of layers gets the name gateway:dev
+```
+
+An image is a **stack of read-only layers**. Each Dockerfile instruction adds one. My real layers
+(`docker history gateway:dev`):
+
+```
+   size     instruction
+   0B       CMD ["uvicorn" …]        ← metadata only, no files
+   0B       USER 10001
+   131kB    COPY gateway/            ← my code: tiny, and changes often
+   39.3MB   COPY .venv               ← dependencies: big, change rarely
+   41kB     useradd app
+   ~150MB   python:3.12-slim base    ← shared with any other image on the same base
+```
+
+**Why the order matters:** Docker reuses (caches) a layer if its instruction and inputs didn't change,
+**but only until the first layer that did change**. Everything after that is rebuilt. Lock files come
+before code, so editing `gateway/main.py` rebuilds only the 131 kB layer, not the 39 MB one. If I'd written
+`COPY . .` first, every code edit would reinstall every dependency.
+
+**Why `.dockerignore` is a security control, not tidiness:** the build context is sent in full *before*
+the Dockerfile runs. Without it, `.env` reaches the engine, and one careless `COPY . .` bakes the API key
+into a layer. Layers are permanent: a later `RUN rm .env` adds a *new* layer that hides the file, while the
+old layer still contains it. Anyone who pulls the image can extract it.
+
+### Why `minikube image load` was needed: there are two Docker engines
+
+```
+ Colima VM
+ ├── Docker engine #1 ← `docker build` put gateway:dev HERE
+ └── container "minikube" (the Kubernetes node)
+     └── Docker engine #2 ← kubelet starts pods from HERE; it can't see engine #1's images
+```
+
+`minikube image load` copies the image from #1 into #2. On a real cluster there's no shared laptop, so
+nodes pull from a **registry** (GHCR in step 4). That's why `imagePullPolicy: Never` is only a
+local-development setting.
+
+---
+
+## 15. Layer 2: the cluster, under the hood
+
+### The control plane (the parts that run the loops)
+
+My cluster's real system pods (`kubectl get pods -n kube-system`):
+
+| Pod | Simple words | What it does |
+|---|---|---|
+| `kube-apiserver-minikube` | The front desk | The **only** way in. `kubectl`, controllers, Argo CD all talk to it. It checks permissions and validates objects |
+| `etcd-minikube` | The filing cabinet | A key-value database holding every object (the desired state). Lose etcd = lose the cluster's memory |
+| `kube-controller-manager-minikube` | The managers | Runs the built-in loops: Deployment, ReplicaSet, endpoints, PVC binding … |
+| `kube-scheduler-minikube` | The seating planner | Picks a node for each new pod, based on its **requests** vs free room |
+| `kube-proxy-…` | The switchboard | Programs the node's network rules so Service IPs reach pod IPs |
+| `coredns-…` | The phone book | Answers "what's the IP of `postgres`?" |
+| `storage-provisioner` | The hardware store | Makes a disk (a folder, on minikube) when a PVC asks for one |
+| *(kubelet, not a pod)* | The hands | An agent on each node that actually starts and stops containers and runs probes |
+
+### What happened when `kubectl apply -f k8s/gateway.yaml` ran: step by step
+
+```
+ kubectl ──1──▶ API server ──2──▶ etcd: Deployment "gateway" (replicas: 2) stored
+                    │
+                    │ 3. Deployment controller (watching) sees a new Deployment
+                    │    → creates ReplicaSet gateway-6b778585c9  (hash of the pod template)
+                    │ 4. ReplicaSet controller: "want 2 pods, have 0" → creates 2 Pod objects
+                    │    (no node yet, status Pending)
+                    │ 5. Scheduler: "pod needs 100m CPU + 128Mi, minikube node has room"
+                    │    → writes nodeName: minikube on each pod
+                    ▼
+               kubelet on node minikube (watching for pods assigned to it)
+                 6. image gateway:dev present? (pullPolicy Never → must be, else ErrImagePull)
+                 7. reads ConfigMap gateway-config + Secret gateway-secrets → env vars
+                 8. starts the container as uid 10001 → uvicorn → lifespan() → connect to postgres
+                 9. runs readiness probe GET /health every 5s → passes → pod marked Ready
+                                    │
+ 10. Endpoints controller: pod is Ready and has label app=gateway
+     → adds its IP to the EndpointSlice of Service "gateway" → it starts receiving traffic
+```
+
+**The real ownership chain** (each object has an `ownerReference` to its parent):
+
+```
+ Deployment/gateway
+   └── ReplicaSet/gateway-6b778585c9          (6b778585c9 = hash of the pod template)
+         ├── Pod/gateway-6b778585c9-vqpls     ip 10.244.0.5
+         └── Pod/gateway-6b778585c9-xddqn     ip 10.244.0.14   ← the one self-heal created
+```
+
+Owners matter for cleanup: delete the Deployment and Kubernetes' garbage collector deletes the ReplicaSet,
+then the pods. A new image or env change produces a **new pod-template hash**, so a new ReplicaSet appears,
+and the rollout is the Deployment shifting pods from the old ReplicaSet to the new one.
+
+**Labels are the glue.** Nothing is linked by name. The Deployment finds its pods by `app: gateway`, and so
+does the Service. A typo in a label = a Service with no endpoints = "connection refused" with every pod
+looking healthy.
+
+---
+
+## 16. Networking under the hood: how `postgres` becomes a working connection
+
+### Step 1: name → IP (CoreDNS)
+
+Inside every pod, `/etc/resolv.conf` (real, from my gateway pod):
+```
+nameserver 10.96.0.10                                         ← CoreDNS's Service IP
+search llm-gateway.svc.cluster.local svc.cluster.local cluster.local
+```
+The gateway asks for `postgres`. The `search` line makes the resolver try
+`postgres.llm-gateway.svc.cluster.local` first, and CoreDNS answers with the Service's IP:
+```
+postgres -> 10.110.99.166        redis -> 10.98.31.225        (real answers from inside the pod)
+```
+That's why a short name works inside the same namespace, and why another namespace would need
+`postgres.llm-gateway`.
+
+### Step 2: Service IP → pod IP (kube-proxy)
+
+🟢 The Service IP is like a company's main phone number. No desk actually has that number; the
+switchboard forwards each call to someone who's in today.
+
+🔵 **Nothing listens on 10.110.99.166.** It's a **virtual IP**. kube-proxy writes network rules (iptables)
+on the node: "packets to 10.110.99.166:5432 → rewrite the destination to one of the *ready* pod IPs in
+the EndpointSlice." The gateway Service's real EndpointSlice right now:
+```
+10.244.0.5  ready=true
+10.244.0.14 ready=true
+```
+
+### This explains the 4 restarts exactly
+
+The crash log said `Connect call failed ('10.110.99.166', 5432)`, which is the **postgres Service IP**. At
+that moment the Postgres pod existed but wasn't *ready* (its image was still downloading), so the
+EndpointSlice was **empty**. For a Service with no endpoints, kube-proxy **rejects** the connection
+immediately, hence "connection refused" rather than a timeout. Then:
+
+```
+ t≈0s    gateway starts → lifespan → connect postgres → refused → process exits → container dies
+ t≈10s   kubelet restarts it (back-off 10s)  → refused again
+ t≈30s   restart (back-off 20s)              → refused again
+ t≈70s   restart (back-off 40s)              → refused again
+ t≈…     postgres pulled, pg_isready passes → added to EndpointSlice
+         restart #4 → connect OK → /health passes → Ready → Running, restarts stay at 4
+```
+The back-off doubles each time (10s, 20s, 40s … capped at 5 minutes). That's what `CrashLoopBackOff`
+means: *crashing, and waiting longer between each retry*. It's a status, not an error type.
+
+### Traffic leaving the cluster (to OpenRouter)
+Pod `10.244.x.x` → node → Colima VM → Mac → internet. Each hop rewrites the source address (NAT), so
+OpenRouter sees my home IP. On OKE the pods sit in a **private** subnet and leave through the NAT gateway
+built in `infra/cluster/network.tf`: out only, nothing can call in.
+
+---
+
+## 17. Config and Secrets under the hood
+
+**Env vars are copied in when the container starts, and then frozen.**
+If Argo CD updates `gateway-config` (say a new `UPSTREAM_BASE_URL`), the **running pods keep the old value**.
+The ConfigMap changed, but the pod template didn't, so there's no new ReplicaSet and no rollout.
+Fix now: `kubectl rollout restart deploy/gateway`. Proper fix later: Kustomize's `configMapGenerator`
+adds a content hash to the ConfigMap's name, so a change produces a new name, which changes the pod
+template and triggers a rollout automatically.
+
+**A Secret is not encrypted, only encoded.**
+```bash
+kubectl get secret gateway-secrets -n llm-gateway -o jsonpath='{.data.POSTGRES_PASSWORD}'
+# → something like  MmJhYmMy…   (base64: anyone can decode it with `base64 -d`)
+```
+The protection is **who can read it** (RBAC, Kubernetes' permission system), not the encoding. On minikube,
+etcd stores it unencrypted on disk. Managed clusters like OKE encrypt etcd's disk for you.
+
+**Every secret in the system today:**
+
+| Secret | Where it lives | Who can use it | If it leaks |
+|---|---|---|---|
+| OpenRouter API key | `.env` on Mac → Secret `gateway-secrets` | gateway pods | Someone spends my OpenRouter credit. Rotate at OpenRouter |
+| Postgres password | Secret `gateway-secrets` only (random, never on disk) | postgres + gateway | Only reachable inside the cluster, so low risk |
+| Deploy key (private) | `~/.ssh/argocd_ai_platform` + Secret `repo-ai-platform` | Argo CD repo-server | Read my code (read-only). Delete the key in GitHub |
+| Tenant keys | Only printed once. Postgres stores SHA-256 hashes | tenants | A DB leak exposes no working keys (Project 1 design) |
+| Argo CD admin password | Secret `argocd-initial-admin-secret` | me | Full control of what's deployed. Change it / delete that Secret on a real cluster |
+
+---
+
+## 18. Storage under the hood: what "the disk survives" really means
+
+```
+ PVC postgres-data (1Gi, "I need a disk")
+   │  storage-provisioner sees an unbound claim
+   ▼
+ PV pvc-… (the actual disk) = folder /tmp/hostpath-provisioner/… on the minikube node
+   │  bound 1:1 to the claim
+   ▼
+ mounted into the postgres pod at /var/lib/postgresql/data  (data in …/pgdata)
+```
+
+| I do this | Data survives? | Why |
+|---|---|---|
+| Delete the postgres **pod** | ✅ | The Deployment makes a new pod, which mounts the same PVC |
+| Update Postgres (Recreate) | ✅ | Same PVC, old pod stops first |
+| Delete the **namespace** | ❌ | PVC deleted → PV deleted (reclaim policy `Delete`) |
+| `minikube delete` | ❌ | The whole node (and its folders) is gone |
+| Remove `postgres.yaml` from Git | ❌ | Argo CD **prune** deletes the PVC |
+
+On OKE the same PVC would create an **OCI Block Volume**, a real network disk that could even move to
+another node if Postgres's pod got rescheduled.
+
+---
+
+## 19. Argo CD under the hood
+
+### Its parts (real pods in namespace `argocd`)
+
+| Pod | Simple words | Job |
+|---|---|---|
+| `argocd-repo-server` | The reader | Clones Git with the deploy key and turns `k8s/` into a list of objects (would also render Helm/Kustomize) |
+| `argocd-application-controller-0` | The thermostat | Compares the list from Git with the live cluster, applies differences, judges health |
+| `argocd-server` | The dashboard | Web UI + API (what `port-forward 8080:443` opens) |
+| `argocd-redis` | Its notepad | A cache for Argo CD itself. **Not** my gateway's Redis |
+| `argocd-dex-server` | SSO door | Login via GitHub/Google etc. (unused, I log in as admin) |
+| `argocd-applicationset-controller` | Card printer | Generates many Applications from one template (unused) |
+| `argocd-notifications-controller` | Messenger | Slack/email on sync events (unused) |
+
+### One loop, step by step
+
+```
+                    ┌───────────────────── about every 3 min (or on a webhook, or "Refresh") ─┐
+                    ▼                                                                          │
+ 1. repo-server: git fetch main over SSH (deploy key)                                         │
+    checks github.com's host key against argocd-ssh-known-hosts-cm                            │
+    (so a fake "github.com" can't feed it manifests)                                          │
+ 2. renders k8s/ → DESIRED objects        (cached per commit SHA, e.g. 8cbb282)               │
+                    │                                                                          │
+ 3. controller: LIVE objects ◀── it keeps a live watch on the cluster, updated instantly      │
+ 4. diff DESIRED vs LIVE → sync status: Synced / OutOfSync                                    │
+ 5. OutOfSync + automated → apply the difference (in a safe order, see below)                 │
+    selfHeal → also re-apply when the LIVE side drifted                                       │
+    prune    → delete LIVE objects it owns that are no longer in DESIRED                      │
+ 6. health check of every object → Healthy / Progressing / Degraded / Missing ────────────────┘
+```
+
+**Why self-heal took 4 seconds but a git push can take up to ~3 minutes:** the two sides are watched
+differently. The cluster side is a **live watch**, so the controller heard about my `kubectl scale` right away.
+The Git side is **polled** every ~3 minutes, because Argo CD has no way to know a commit happened until
+it asks. Teams add a GitHub **webhook** ("GitHub calls Argo CD when you push") to make it instant, but
+that needs Argo CD to be reachable *from* the internet, which a laptop cluster (or a private OKE cluster)
+isn't. Polling is the price of not exposing anything.
+
+### Two separate questions: "sync" vs "health"
+
+| | Question | Values |
+|---|---|---|
+| **Sync status** | Does the cluster match Git? | `Synced`, `OutOfSync` |
+| **Health status** | Is what's running actually working? | `Healthy`, `Progressing`, `Degraded`, `Missing` |
+
+They're independent. **Synced + Degraded** = "I applied exactly what Git says, and it's broken," which is
+what a bad release looks like. It's also why Argo CD alone doesn't protect you from bad code: it faithfully
+deploys it. That's the job of the canary in step 5.
+
+For a Deployment, "Healthy" means the rollout finished and the wanted replicas are available (readiness
+probes passing). ConfigMaps and Services have no health, which is why they showed a blank.
+
+### How it "adopted" what I'd created by hand
+
+Argo CD marks every object it manages with an annotation (real, from my gateway Deployment):
+```
+argocd.argoproj.io/tracking-id: gateway:apps/Deployment:llm-gateway/gateway
+                                └app┘ └── kind ──────┘ └namespace/name┘
+```
+On the first sync, my hand-made objects had the same kind, namespace and name as Git, so Argo CD applied
+Git's version on top and stamped the annotation. No duplicates, no restarts. **Prune only deletes objects
+that carry this annotation**, which is why `gateway-secrets` (created by hand, never stamped) is safe.
+
+### Order of applying
+
+Argo CD sorts objects by kind before applying: Namespace → Secrets/ConfigMaps → PVCs → Services →
+Deployments … So the namespace exists before anything inside it, whatever the filenames are. The `00-` prefix
+is only for plain `kubectl apply -f k8s/`, which goes alphabetically.
+
+### Its memory of what it deployed
+```
+history: id 0 → revision 8cbb282 deployed 2026-09-29T10:41:10Z
+```
+Every sync records the Git commit it deployed. A rollback in GitOps is normally `git revert` (so Git stays
+the truth). The history tells you *which* commit was live when something broke.
+
+---
+
+## 20. The full picture: one change, end to end (today vs. after step 4)
+
+**Today, if I change `replicas: 2 → 3` in `k8s/gateway.yaml` and push:**
+```
+ git push ─▶ GitHub main (new SHA)
+             ... up to ~3 min: Argo CD's next poll fetches it ...
+ repo-server renders → controller diffs: Deployment.spec.replicas 2 ≠ 3 → OutOfSync
+ → applies → Deployment controller → ReplicaSet wants 3 → +1 Pod → scheduler → kubelet
+ → readiness passes → EndpointSlice gets a 3rd IP → Synced + Healthy, history id 1 = new SHA
+```
+
+**If I change gateway *code* today:** Git alone does nothing useful. The image `gateway:dev` is built and
+loaded by hand, and the Deployment's text never changes. **This is the gap step 4 closes:** CI builds an
+image tagged with the commit SHA and commits that tag into `k8s/gateway.yaml`. Then a code change *is*
+a manifest change, and Argo CD rolls it out like the replicas example.
+
+---
+
+## 21. What's still manual, and rebuilding from zero
+
+Everything in Git rebuilds itself. These don't, on purpose (they're either secrets or the thing that
+starts the robot):
+
+```bash
+# 1. The boxes
+colima start --cpu 4 --memory 6
+minikube start --driver=docker --cpus=4 --memory=5g
+# 2. The image: nothing to do, CI pushed it to GHCR. Pods pull it with ghcr-pull (step 4).
+# 3. Argo CD itself (pinned version)
+kubectl create namespace argocd
+kubectl apply -n argocd --server-side -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.3/manifests/install.yaml
+# 4. Secrets (never in Git): the repo key for Argo CD, the app secrets (section 10)
+kubectl create secret generic repo-ai-platform -n argocd --from-literal=type=git \
+  --from-literal=url=git@github.com:musishere/AI-platform-engineering.git \
+  --from-file=sshPrivateKey=$HOME/.ssh/argocd_ai_platform
+kubectl label secret repo-ai-platform -n argocd argocd.argoproj.io/secret-type=repository
+#    + gateway-secrets and ghcr-pull (section 10; the namespace is created by step 5, or apply 00-namespace.yaml first)
+# 5. The bootstrap: from here on, Git drives
+kubectl apply -f argocd/gateway.yaml
+```
+
+`--server-side` in step 3: Argo CD's own object definitions (CRDs, "custom resource definitions", which
+teach Kubernetes new kinds like `Application`) are too big for normal `kubectl apply`. It saves a copy of
+each object in an annotation limited to 256 KB. Server-side apply keeps that bookkeeping in the API server
+instead.
+
+On OKE, steps 1 (and eventually 3–5) become Terraform. That's the "Terraform builds the building,
+GitOps arranges the furniture" split.
+
+---
+
+## 22. Check yourself (Part 2)
+
+**Q6.** I push a new `UPSTREAM_BASE_URL` in `k8s/config.yaml`. Argo CD shows Synced + Healthy. Are the gateways using the new URL?
+<details><summary>Answer</summary>
+No. Env vars are read once at container start. The ConfigMap changed, but the Deployment's pod template
+didn't, so there was no rollout and the pods keep the old value. `kubectl rollout restart`, or a hashed
+ConfigMap name via Kustomize. See 17.
+</details>
+
+**Q7.** I make a typo: the gateway Service's selector says `app: gatway`. All pods are Running and Ready. What does a caller see, and why?
+<details><summary>Answer</summary>
+Connection refused. The selector matches no pods, the EndpointSlice is empty, and kube-proxy rejects
+connections to a Service with no endpoints. Same symptom as the 4 startup restarts, but permanent.
+Check with `kubectl get endpointslice`. See 15–16.
+</details>
+
+**Q8.** Argo CD says **Synced + Degraded**. Whose fault is it, Argo CD's or the release's, and would rolling back with `kubectl rollout undo` stick?
+<details><summary>Answer</summary>
+The release's: Argo CD applied exactly what Git says, and what Git says doesn't work. `kubectl rollout undo`
+won't stick, because selfHeal sees the cluster no longer matches Git and re-applies the broken version.
+The GitOps rollback is `git revert` + push. See 19.
+</details>
+
+**Q9.** Why did deleting a gateway pod by hand (or scaling it) cause no downtime, but deleting the Postgres pod would?
+<details><summary>Answer</summary>
+The gateway has 2 ready replicas behind one Service, and the other keeps serving while the loop replaces
+the missing one. Postgres has 1 replica with `Recreate`, so until the new pod is ready the Service has no
+endpoints and the gateway's DB calls fail. See 5.5, 15, 16.
+</details>

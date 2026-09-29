@@ -23,14 +23,19 @@ spec:
         # Refuse to start if the image ever runs as root. The Dockerfile
         # already uses UID 10001; this catches a future image that forgets to.
         runAsNonRoot: true
+      # The GHCR image is private: this Secret (a read-only token, created by
+      # hand per cluster, never committed) is the kubelet's login for pulling.
+      imagePullSecrets:
+        - name: ghcr-pull
       containers:
         - name: gateway
-          # Loaded by hand with `minikube image load` for now. The tag never
-          # changes, so a rebuild needs `kubectl rollout restart`. CI (step 4)
-          # replaces this with a GHCR image tagged by git SHA.
+          # Written by CI (.github/workflows/gateway.yml) on every merge to
+          # main: one tag per commit. Don't edit by hand; merge code instead.
           image: gateway:dev
-          # Use the image already on the node; there's no registry to pull from yet.
-          imagePullPolicy: Never
+          # Safe only because tags are never reused: a SHA tag always means
+          # the same bytes, so a copy already on the node is the right one.
+          # (With a reused tag like :latest this would run stale code.)
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
           envFrom:

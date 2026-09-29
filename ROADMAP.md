@@ -92,7 +92,7 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 - [x] Terraform: VCN (OCI's VPC)
 - [ ] Terraform: OKE cluster (OCI's EKS)
 - [ ] Terraform: OKE Workload Identity for pod-level OCI permissions (OCI's IRSA)
-- [ ] Argo CD deploying the gateway
+- [x] Argo CD deploying the gateway
 - [ ] CI/CD pipeline: build
 - [ ] CI/CD pipeline: scan
 - [ ] CI/CD pipeline: push
