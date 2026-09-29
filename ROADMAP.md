@@ -85,6 +85,8 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 
 **Cloud:** Oracle Cloud (OCI), home region Mumbai (`ap-mumbai-1`), in place of AWS. Always Free resources only, except Workload Identity, which needs an enhanced cluster and must be done within the $300 / 30-day trial (ends ~2026-10-28). Build, test, destroy each session.
 
+**Status (2026-09-29):** OKE deploy deferred until funded (free ARM workers are OUT_OF_HOST_CAPACITY in Mumbai, and I'm not paying). Meanwhile Argo CD, CI/CD and canary are built on a local minikube cluster ($0); switching to OKE later means pointing Argo CD at the new cluster.
+
 **What to build**
 - [x] Terraform: remote state (Object Storage), done first so no paid resource is ever tracked only on my laptop
 - [x] Terraform: VCN (OCI's VPC)

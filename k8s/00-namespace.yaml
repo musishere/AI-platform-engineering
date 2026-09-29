@@ -1,0 +1,8 @@
+# Namespace: one folder for everything the gateway runs on the cluster.
+# Deleting it removes the whole stack in one command (Postgres data included).
+# The "00-" prefix makes `kubectl apply -f k8s/` create it before the files
+# that live inside it (kubectl applies files alphabetically).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm-gateway

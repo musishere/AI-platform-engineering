@@ -17,3 +17,9 @@
 - **Learned:** Redis runs one command at a time, and Lua bundles several steps into one; leases vs counters; "reset" by changing the key name each month; one start time must decide the month everywhere; NX for rebuild races.
 - **Broke:** "check before, add after" let 20 simultaneous requests all see the old count (up to 20 calls of overshoot). Fixed with the hold: 20 at once with 100 left → 4 allowed, 0 overshoot. Also fixed: backwards clock could remove tickets, calls across midnight were counted in two months, keys could clash with another app's.
 - **Next:** write the Project 1 and Project 2 notes, then Project 3 (Terraform, EKS, Argo CD, CI/CD).
+
+## 2026-09-28: Project 3 start, Oracle Cloud (Terraform)
+- **Built:** switched from AWS to Oracle Cloud (Mumbai, Always Free + $300/30-day trial). `infra/bootstrap` (permanent, free): compartment, versioned private state bucket with `prevent_destroy`, $20/$50 budget alerts; its state moved into the bucket. `infra/cluster` (per session): VCN with 3 subnets (public API, public LB, private workers), internet/NAT/service gateways, Oracle's reference security rules; OKE basic cluster v1.36.1 + 2×ARM node pool.
+- **Learned:** Terraform plan → apply → destroy and state; remote state between folders; new-compartment permissions take minutes to spread (flickering 404s, so wait for N successes in a row); "not found" can mean "not allowed"; NAT = out only; the Kubernetes API endpoint is the cluster's control desk, not a gateway.
+- **Broke:** worker nodes never started: Mumbai OUT_OF_HOST_CAPACITY for free ARM (and even the free AMD micro), confirmed with a capacity report. Also misread the session expiry (local time, not UTC), so a destroy and watcher failed on an expired login.
+- **Next:** wait for free ARM capacity (watcher running), then rebuild the cluster and check `kubectl get nodes`. Everything in `infra/cluster` destroyed; only bootstrap left (free).

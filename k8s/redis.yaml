@@ -1,0 +1,51 @@
+# Redis for the gateway's rate limits (token buckets) and monthly quota
+# counters.
+#
+# No disk on purpose: every counter can be rebuilt from Postgres (real
+# tokens + open holds, Project 2). Losing Redis means a short rebuild, not
+# lost money, so a disk would only be one more thing to break.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: llm-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:8-alpine
+          # Turn off Redis's own snapshots too. With no disk they would only
+          # write into the container and be lost on restart anyway.
+          args: [--save, "", --appendonly, "no"]
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec:
+              command: [redis-cli, ping]
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+---
+# Stable address "redis:6379". REDIS_URL in config.yaml points here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: llm-gateway
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379

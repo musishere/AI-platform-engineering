@@ -1,0 +1,8 @@
+# Keep secrets and junk out of the image. Without this, `.env` (the real API
+# key) would be sent to the Docker build and could end up in a pushed image.
+.env
+.venv
+.git
+__pycache__
+infra
+*.tfvars

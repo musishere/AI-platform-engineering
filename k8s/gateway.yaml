@@ -1,0 +1,89 @@
+# The LLM gateway itself (the image built from Dockerfile).
+#
+# Two replicas behind one Service: one pod can be replaced while the other
+# keeps serving, and the canary (step 5) needs pods to split traffic across.
+# Extra copies are safe because the gateway keeps no state in memory:
+# everything lives in Postgres and Redis.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: llm-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      securityContext:
+        # Refuse to start if the image ever runs as root. The Dockerfile
+        # already uses UID 10001; this catches a future image that forgets to.
+        runAsNonRoot: true
+      containers:
+        - name: gateway
+          # Loaded by hand with `minikube image load` for now. The tag never
+          # changes, so a rebuild needs `kubectl rollout restart`. CI (step 4)
+          # replaces this with a GHCR image tagged by git SHA.
+          image: gateway:dev
+          # Use the image already on the node; there's no registry to pull from yet.
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: gateway-config
+          # Only the two secret keys the gateway needs, not the whole Secret
+          # (it doesn't need POSTGRES_PASSWORD on its own).
+          env:
+            - name: UPSTREAM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: UPSTREAM_API_KEY
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: DATABASE_URL
+          securityContext:
+            allowPrivilegeEscalation: false
+          # Both probes use /health, which never touches the DB. A DB blip
+          # therefore doesn't restart every gateway at once.
+          # ponytail: readiness stays "ready" while Postgres is down; add a
+          # DB-checking /ready for readiness once real traffic matters.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+---
+# One stable address for both gateway pods. ClusterIP = reachable only
+# inside the cluster; from the Mac I use `kubectl port-forward`. On OKE this
+# becomes a LoadBalancer (or Ingress) in the public LB subnet.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: llm-gateway
+spec:
+  selector:
+    app: gateway
+  ports:
+    - port: 80
+      targetPort: 8000

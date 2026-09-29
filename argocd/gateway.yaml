@@ -1,0 +1,33 @@
+# Argo CD Application: the "instruction card" telling Argo CD what to deploy.
+#
+# It says: keep namespace llm-gateway on this cluster identical to the k8s/
+# folder on the main branch. Applied once by hand (the bootstrap step); after
+# that, a push to main is the deploy (deployment.md section 4).
+#
+# The repo is private, so Argo CD reads it with a read-only deploy key stored
+# in a Secret in the argocd namespace, created by hand, never committed.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gateway
+  namespace: argocd
+spec:
+  project: default
+  source:
+    # SSH URL because the credential is an SSH deploy key.
+    repoURL: git@github.com:musishere/AI-platform-engineering.git
+    targetRevision: main
+    path: k8s
+  destination:
+    # "This same cluster": Argo CD deploys into the cluster it runs in.
+    server: https://kubernetes.default.svc
+    namespace: llm-gateway
+  syncPolicy:
+    automated:
+      # prune: a file deleted from k8s/ gets its object deleted from the
+      # cluster. Only objects Argo CD created, so the hand-made
+      # gateway-secrets is safe. Risk: removing postgres.yaml deletes the DB.
+      prune: true
+      # selfHeal: hand edits (kubectl edit) get reverted to what Git says,
+      # so Git stays the single source of truth.
+      selfHeal: true

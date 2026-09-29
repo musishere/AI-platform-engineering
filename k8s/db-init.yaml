@@ -1,0 +1,94 @@
+# GENERATED from db/*.sql. Don't edit by hand; regenerate after changing db/:
+#   kubectl create configmap db-init -n llm-gateway --from-file=db/ --dry-run=client -o yaml
+# Postgres runs these files once, only when its data folder is empty
+# (deployment.md 5.6). ponytail: copy can drift from db/; a CI check or a
+# migration Job replaces this when the first new migration lands.
+apiVersion: v1
+data:
+  001_tenants.sql: |
+    -- Tenants: the callers allowed to use the gateway (a team, an app, a customer).
+    --
+    -- `id` is the tenant's identity and never changes; later tables (usage_events)
+    -- point at it. The API key is only proof of identity, so we store just its
+    -- SHA-256 hash: a leaked database contains no working keys.
+    --
+    -- Apply: psql "$DATABASE_URL" -f db/001_tenants.sql
+
+    CREATE TABLE tenants (
+        id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name         text        NOT NULL UNIQUE,
+        -- UNIQUE also creates the index that makes the per-request lookup fast.
+        api_key_hash text        NOT NULL UNIQUE,
+        created_at   timestamptz NOT NULL DEFAULT now()
+    );
+  002_usage_events.sql: |
+    -- Usage events: one row per call a known tenant makes through the gateway.
+    --
+    -- Written in two steps: INSERT before we forward (so a call is never
+    -- invisible) and UPDATE after (tokens, cost, latency). A row whose
+    -- status_code is still NULL means the call started but never finished
+    -- (crash, or the final write failed): it's visible, just missing numbers.
+    --
+    -- Apply: psql "$DATABASE_URL" -f db/002_usage_events.sql
+
+    CREATE TABLE usage_events (
+        id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        -- The tenant's identity, never the key: keys rotate, history must not.
+        tenant_id         bigint      NOT NULL REFERENCES tenants(id),
+        model             text,
+        status_code       int,
+        input_tokens      int,
+        output_tokens     int,
+        -- From our own price table, stored at call time so a later price change
+        -- doesn't rewrite history. NULL = model not in the table, never a fake 0.
+        cost_usd          numeric(12, 8),
+        -- What the provider says it charged, when it tells us. Compared against
+        -- cost_usd to catch a stale price table (reconciliation).
+        provider_cost_usd numeric(12, 8),
+        latency_ms        int,
+        created_at        timestamptz NOT NULL DEFAULT now()
+    );
+
+    -- For "how much did tenant X use this month?"
+    CREATE INDEX ON usage_events (tenant_id, created_at);
+  003_usage_outcome.sql: |
+    -- How each call ended, so exact rows can be told apart from estimated ones:
+    --   complete            - reply fully read; token counts are exact
+    --                         (or NULL because there was no reply, e.g. a 400)
+    --   client_disconnected - caller left mid-stream; output_tokens is estimated
+    --   upstream_error      - the stream broke on the provider's side midway;
+    --                         output_tokens is estimated
+    -- NULL on rows written before this column existed.
+    --
+    -- Apply: psql "$DATABASE_URL" -f db/003_usage_outcome.sql
+
+    ALTER TABLE usage_events ADD COLUMN outcome text;
+  004_tenant_limits.sql: |
+    -- Per-tenant limits, read in the same query as the API key check (no extra
+    -- round trip per request).
+    --
+    --   burst               - token bucket size: requests allowed at once
+    --   refill_per_second   - bucket refill rate: the long-run average request rate
+    --   monthly_token_quota - input + output tokens allowed per calendar month (UTC)
+    --
+    -- Apply: psql "$DATABASE_URL" -f db/004_tenant_limits.sql
+
+    ALTER TABLE tenants
+        ADD COLUMN burst               int              NOT NULL DEFAULT 20      CHECK (burst > 0),
+        ADD COLUMN refill_per_second   double precision NOT NULL DEFAULT 1       CHECK (refill_per_second > 0),
+        ADD COLUMN monthly_token_quota bigint           NOT NULL DEFAULT 1000000 CHECK (monthly_token_quota >= 0);
+  005_usage_quota_hold.sql: |
+    -- The quota "card hold" taken when the call started (estimated tokens).
+    --
+    -- Stored on the row so Postgres can rebuild the Redis counter exactly: a
+    -- finished call counts its real tokens, a call still in flight (status_code
+    -- NULL) counts its hold, just like the live counter does. A call that crashed
+    -- and never finished keeps counting its hold, which errs on the safe side.
+    --
+    -- Apply: psql "$DATABASE_URL" -f db/005_usage_quota_hold.sql
+
+    ALTER TABLE usage_events ADD COLUMN quota_hold int;
+kind: ConfigMap
+metadata:
+  name: db-init
+  namespace: llm-gateway

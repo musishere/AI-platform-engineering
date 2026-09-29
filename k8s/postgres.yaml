@@ -1,0 +1,101 @@
+# Postgres for the gateway: tenants, usage events, quota holds.
+#
+# In-cluster on purpose for the $0 local setup. With real data you'd use a
+# managed database (backups, patching, failover done for you). Three objects:
+# a disk (PVC), the pod manager (Deployment) and the stable address (Service).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: llm-gateway
+spec:
+  # ReadWriteOnce = one node mounts it at a time, which is all a single
+  # Postgres needs. On minikube it's a folder on the node; on OKE the same
+  # claim would become an OCI Block Volume.
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: llm-gateway
+spec:
+  replicas: 1
+  # Stop the old pod BEFORE starting the new one. A rolling update would run
+  # two Postgres processes on the same data folder for a moment, which
+  # corrupts it. Cost: a few seconds of downtime on each Postgres update.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          # Pinned major version: a new major changes the on-disk format, and
+          # the new version can't read the old data folder.
+          image: postgres:17-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: gateway
+            - name: POSTGRES_DB
+              value: gateway
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: POSTGRES_PASSWORD
+            # A subfolder, not the mount root: some disks come with a
+            # lost+found folder at the root, and Postgres refuses to start
+            # in a non-empty folder.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            # Postgres runs every .sql here, in name order, the first time
+            # it starts with an empty data folder. That's why the files are
+            # numbered 001_, 002_...
+            - name: db-init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          # Ready = accepting connections. Until then, the Service sends it no
+          # traffic, so the gateway's first connects don't hit a half-started DB.
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, gateway, -d, gateway]
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+        - name: db-init
+          configMap:
+            name: db-init
+---
+# Stable address "postgres:5432" for the gateway, whatever the pod's IP is.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: llm-gateway
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
