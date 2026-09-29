@@ -82,21 +82,39 @@ spec:
                   key: DATABASE_URL
           securityContext:
             allowPrivilegeEscalation: false
-          # Both probes use /health, which never touches the DB. A DB blip
+          # All probes use /health, which never touches the DB. A DB blip
           # therefore doesn't restart every gateway at once.
           # ponytail: readiness stays "ready" while Postgres is down; add a
           # DB-checking /ready for readiness once real traffic matters.
+          #
+          # Startup: "has it finished booting?" Liveness and readiness are
+          # off until this passes once. Without it, liveness judged pods from
+          # second 0 and killed 4 healthy-but-booting gateways on a busy node
+          # (2026-09-29). Allows up to 30 x 2s = 60s to boot, checked every 2s
+          # so a fast boot still becomes ready quickly.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 2
+            failureThreshold: 30
+            timeoutSeconds: 3
+          # Liveness: once running, restart a frozen process quickly (~30s).
+          # timeoutSeconds 3, not the 1s default: a busy node can delay an
+          # answer from a perfectly healthy process.
           livenessProbe:
             httpGet:
               path: /health
               port: 8000
             periodSeconds: 10
             failureThreshold: 3
+            timeoutSeconds: 3
           readinessProbe:
             httpGet:
               path: /health
               port: 8000
             periodSeconds: 5
+            timeoutSeconds: 3
           resources:
             requests:
               cpu: 100m
