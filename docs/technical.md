@@ -1,8 +1,9 @@
 # Technical Reference: LLM Gateway Platform
 
-> **Status (2026-09-29):** Projects 1 (gateway) and 2 (quotas and rate limits) are built. Project 3 (deploy)
+> **Status (2026-09-30):** Projects 1 (gateway) and 2 (quotas and rate limits) are built. Project 3 (deploy)
 > is in progress: the Terraform for the Oracle Cloud network and cluster is written, and the gateway runs on
-> a local minikube cluster deployed by Argo CD. CI/CD (build, scan, push, canary) is next.
+> a local minikube cluster deployed by Argo CD. CI/CD is done: every code push is built, scanned, pushed to GHCR and released as a canary. The OKE
+> cluster itself is blocked on cloud capacity.
 >
 > This file is the **deep technical walkthrough of the whole repo**: every module, the data model, every
 > failure path, and the reason behind each decision. For Kubernetes internals (pods, Services, DNS, Argo CD's
@@ -49,12 +50,12 @@ What it does on every call:
 
 | Concern | What happens | Module |
 |---|---|---|
-| Auth | Turns the caller's API key into a tenant id | [gateway/auth.py](gateway/auth.py) |
-| Rate limit | Stops a tenant calling too fast (token bucket in Redis) | [gateway/limits.py](gateway/limits.py) |
-| Quota | Stops a tenant using too many tokens per month (Redis counter, rebuilt from Postgres) | [gateway/limits.py](gateway/limits.py) |
-| Forwarding | Sends the request on to the provider unchanged | [gateway/forwarding.py](gateway/forwarding.py) |
-| Metering | Records tokens, cost, latency, status per call in Postgres | [gateway/metering.py](gateway/metering.py) |
-| Streaming | Relays streamed replies piece by piece while still metering them | [gateway/streaming.py](gateway/streaming.py) |
+| Auth | Turns the caller's API key into a tenant id | [gateway/auth.py](../gateway/auth.py) |
+| Rate limit | Stops a tenant calling too fast (token bucket in Redis) | [gateway/limits.py](../gateway/limits.py) |
+| Quota | Stops a tenant using too many tokens per month (Redis counter, rebuilt from Postgres) | [gateway/limits.py](../gateway/limits.py) |
+| Forwarding | Sends the request on to the provider unchanged | [gateway/forwarding.py](../gateway/forwarding.py) |
+| Metering | Records tokens, cost, latency, status per call in Postgres | [gateway/metering.py](../gateway/metering.py) |
+| Streaming | Relays streamed replies piece by piece while still metering them | [gateway/streaming.py](../gateway/streaming.py) |
 
 **Upstream today:** OpenRouter (`https://openrouter.ai/api`), which speaks the Anthropic Messages format and
 routes to Claude. The model used in testing is `anthropic/claude-haiku-4.5`. Switching to Anthropic directly
@@ -145,14 +146,14 @@ That keeps the pipeline readable as routing and guardrails get added in later pr
 | Deploy | **Argo CD** (GitOps) | The cluster pulls from Git, so Git is the single source of truth and CI never needs cluster credentials. | A push-based pipeline's simplicity. |
 | Infra as code | **Terraform** (OCI provider) | Build and destroy the whole cloud setup each session, with state in a remote bucket. | — |
 
-Dependencies (from [pyproject.toml](pyproject.toml)): `fastapi`, `uvicorn`, `httpx`, `asyncpg`, `redis`.
-Dev only: `anthropic` (for [scripts/client.py](scripts/client.py)). Python ≥ 3.12.
+Dependencies (from [pyproject.toml](../pyproject.toml)): `fastapi`, `uvicorn`, `httpx`, `asyncpg`, `redis`.
+Dev only: `anthropic` (for [scripts/client.py](../scripts/client.py)). Python ≥ 3.12.
 
 ---
 
 ## 5. Life of one request
 
-This is `messages()` in [gateway/main.py](gateway/main.py), step by step. The **order is the design**: cheap
+This is `messages()` in [gateway/main.py](../gateway/main.py), step by step. The **order is the design**: cheap
 checks first, anything that costs money last, and every step that can fail before spending money fails
 *closed* (refuses).
 
@@ -226,7 +227,7 @@ request
 
 ---
 
-## 6. Auth ([gateway/auth.py](gateway/auth.py))
+## 6. Auth ([gateway/auth.py](../gateway/auth.py))
 
 **Problem:** know which tenant is calling, without storing anything that would let an attacker call as them
 if the database leaked.
@@ -280,7 +281,7 @@ One query returns identity **and** limits, so adding limits in Project 2 cost no
 
 The header is `x-api-key` because that's what the Anthropic SDK already sends.
 
-### Creating a tenant ([gateway/create_tenant.py](gateway/create_tenant.py))
+### Creating a tenant ([gateway/create_tenant.py](../gateway/create_tenant.py))
 
 ```bash
 uv run --env-file .env python -m gateway.create_tenant <name>
@@ -291,7 +292,7 @@ key can only be replaced, not recovered. A duplicate name exits with an error (`
 
 ---
 
-## 7. Limits ([gateway/limits.py](gateway/limits.py))
+## 7. Limits ([gateway/limits.py](../gateway/limits.py))
 
 **Problem:** stop a tenant calling too **fast** (rate limit) or too **much** (monthly token quota), before
 any money is spent, and stay correct when several gateway copies handle the same tenant at the same moment.
@@ -451,7 +452,7 @@ removes all spending protection. For a gateway that spends real money per reques
 
 ---
 
-## 8. Forwarding ([gateway/forwarding.py](gateway/forwarding.py))
+## 8. Forwarding ([gateway/forwarding.py](../gateway/forwarding.py))
 
 **Problem:** send the caller's request to the provider and return the answer, without the gateway needing a
 code change every time the provider's API gains a field.
@@ -514,7 +515,7 @@ of `anthropic/claude-haiku-4.5`), which affects the price table.
 
 ---
 
-## 9. Metering ([gateway/metering.py](gateway/metering.py))
+## 9. Metering ([gateway/metering.py](../gateway/metering.py))
 
 **Problem:** record who called, how many tokens, what it cost, and how long it took, for every call, even
 when things break halfway.
@@ -567,7 +568,7 @@ cost = (input_tokens × in_price + output_tokens × out_price) / 1,000,000
 
 ---
 
-## 10. Streaming ([gateway/streaming.py](gateway/streaming.py))
+## 10. Streaming ([gateway/streaming.py](../gateway/streaming.py))
 
 **Problem:** with `"stream": true`, the reply arrives as a series of **Server-Sent Events** (SSE: a
 long-lived HTTP response where the server writes `event:` / `data:` lines as they happen). The caller must
@@ -644,7 +645,7 @@ reply.
 
 ## 11. Data model
 
-Migrations live in [db/](db/) and are applied in name order. Locally with `psql "$DATABASE_URL" -f …`; on
+Migrations live in [db/](../db/) and are applied in name order. Locally with `psql "$DATABASE_URL" -f …`; on
 Kubernetes, Postgres runs them automatically on first start with an empty data folder (see section 16).
 
 ### `tenants`
@@ -792,7 +793,7 @@ effect on the tenant's next request (they're read on every auth lookup; there's 
 
 ## 15. Packaging: the container image
 
-[Dockerfile](Dockerfile), two stages ("a workshop and a delivery box"):
+[Dockerfile](../Dockerfile), two stages ("a workshop and a delivery box"):
 
 **Stage 1 (build):** `python:3.12-slim` + pinned `uv 0.11.7`.
 - Copies only `pyproject.toml` and `uv.lock` first, then `uv sync --frozen --no-dev --no-install-project`.
@@ -806,7 +807,7 @@ effect on the tenant's next request (they're read on every auth lookup; there's 
 - `PYTHONUNBUFFERED=1` so logs appear immediately in `kubectl logs`.
 - `CMD uvicorn gateway.main:app --host 0.0.0.0 --port 8000` (no `--reload`, that's for local dev).
 
-[.dockerignore](.dockerignore) keeps `.env` (the real API key), `.venv`, `.git`, `infra`, and `*.tfvars` out
+[.dockerignore](../.dockerignore) keeps `.env` (the real API key), `.venv`, `.git`, `infra`, and `*.tfvars` out
 of the build context, so secrets can never end up in a pushed image.
 
 ---
@@ -824,17 +825,18 @@ Kubernetes node as a container) → namespace `llm-gateway`. Cost: $0.
 |---|---|---|
 | `00-namespace.yaml` | Namespace `llm-gateway` | `00-` prefix so `kubectl apply -f k8s/` creates it first. Deleting it removes everything. |
 | `config.yaml` | ConfigMap `gateway-config` | `UPSTREAM_BASE_URL`, `REDIS_URL=redis://redis:6379/0` ("redis" = the Service name, resolved by cluster DNS). |
-| `gateway.yaml` | Deployment (2 replicas) + Service (ClusterIP :80 → 8000) | `runAsNonRoot`, `allowPrivilegeEscalation: false`; only the 2 needed Secret keys injected; liveness + readiness on `/health`; requests 100m CPU / 128Mi, limit 256Mi. Image `gateway:dev` with `imagePullPolicy: Never` (loaded with `minikube image load`). |
-| `postgres.yaml` | PVC (1Gi) + Deployment + Service | `postgres:17-alpine` (major pinned: a new major can't read the old data folder); `strategy: Recreate` (two Postgres processes on one data folder corrupts it); `PGDATA` in a subfolder (avoids `lost+found`); `pg_isready` readiness. |
+| `gateway.yaml` | **Rollout** (4 replicas) + Service `gateway` (all pods) + Service `gateway-canary` (canary pods only) | `runAsNonRoot`, `allowPrivilegeEscalation: false`; only the 2 needed Secret keys injected; startup probe (60 s to boot) then liveness + readiness on `/health`, 3 s timeouts; requests 100m CPU / 128Mi, limit 256Mi. Image `ghcr.io/…/gateway:<git-sha>`, written by CI, pulled with the `ghcr-pull` Secret, `IfNotPresent` (safe because tags are never reused). Canary: `maxUnavailable: 0`, `maxSurge: 1`. |
+| `gateway-smoke.yaml` | AnalysisTemplate `gateway-smoke` | A Job sends 5 fake-key requests to `gateway-canary`; all must return 401 (proves the new code runs and reaches Postgres, $0). Own file because CI rewrites every `image:` line in `gateway.yaml`. |
+| `postgres.yaml` | PVC (1Gi) + Deployment + Service | `postgres:17-alpine` (major pinned: a new major can't read the old data folder); `strategy: Recreate` (two Postgres processes on one data folder corrupts it); `PGDATA` in a subfolder (avoids `lost+found`); `pg_isready` readiness with a 5 s timeout (the 1 s default flapped under load). |
 | `redis.yaml` | Deployment + Service | `redis:8-alpine`, **no disk and snapshots off** (`--save "" --appendonly no`): every counter is rebuildable from Postgres. |
 | `db-init.yaml` | ConfigMap `db-init` | **Generated** from `db/*.sql`, mounted at `/docker-entrypoint-initdb.d`. Postgres runs those files once, on first start with an empty data folder. |
 
-**Why 2 gateway replicas:** one can be replaced while the other keeps serving, and the canary rollout needs
-pods to split traffic across. Safe because the gateway is stateless.
+**Why 4 gateway replicas:** with no traffic router, the canary split *is* the pod count (the Service picks
+pods at random), so 4 pods allow clean 25% / 50% steps. Safe because the gateway is stateless.
 
 ### Argo CD (GitOps)
 
-[argocd/gateway.yaml](argocd/gateway.yaml) is an Argo CD `Application`: "keep namespace `llm-gateway` on this
+[argocd/gateway.yaml](../argocd/gateway.yaml) is an Argo CD `Application`: "keep namespace `llm-gateway` on this
 cluster identical to `k8s/` on `main`". Applied once by hand; after that, a push to `main` *is* the deploy.
 
 - Source: `git@github.com:musishere/AI-platform-engineering.git`, path `k8s`, via a read-only SSH deploy key
@@ -847,12 +849,24 @@ cluster identical to `k8s/` on `main`". Applied once by hand; after that, a push
 - **Pull-based:** Argo CD runs inside the cluster and pulls from Git, so CI will never need cluster
   credentials.
 
-### Gaps that the next steps close
+### CI/CD and canary releases
 
-- The image tag `gateway:dev` never changes, so a rebuilt image needs `kubectl rollout restart`. CI (next) will
-  push images to GHCR tagged with the **git SHA** and commit that tag into `k8s/gateway.yaml`, so a code
-  change becomes a manifest change and Argo CD rolls it out.
-- Canary: new version gets a slice of traffic first, promoted only if healthy.
+```
+git push (code) → GitHub Actions: build → Trivy scan → push ghcr.io/…/gateway:<sha> → commit tag to k8s/
+                → Argo CD: applies the new Rollout spec
+                → Argo Rollouts: 25% (1 of 4 pods) → smoke test → 2 min → 50% → 2 min → 100%
+                                 smoke test fails → abort: canary removed, stable back to 4, app Degraded
+```
+
+- **CI** ([.github/workflows/gateway.yml](../.github/workflows/gateway.yml)) runs only when image inputs change
+  (`gateway/**`, `Dockerfile`, lock files). Scan happens before push, and the exact scanned image is pushed.
+  The tag commit doesn't retrigger CI (GitHub never starts workflows from `GITHUB_TOKEN` commits).
+- **Argo CD** never builds anything; the tag commit in `k8s/` is the only link between code and cluster.
+- **Argo Rollouts** turns `setWeight` into pod counts (`ceil(replicas × weight)` for each side); kube-proxy
+  spreads *connections* evenly over ready pods, so the split is per connection, not per request.
+- **Rollback after an abort** is `git revert` + push. Hand edits get reverted by selfHeal.
+- **Known gap:** the smoke test runs once, at 25%. Errors that only appear on real traffic during the pauses
+  aren't caught; Project 4 adds a metrics-based background analysis.
 
 ---
 
@@ -886,7 +900,7 @@ notices.
 Reads the compartment id from bootstrap's state via `terraform_remote_state` (no copy-pasted ids, so the two
 can't drift).
 
-**Network ([network.tf](infra/cluster/network.tf)), following Oracle's reference layout for OKE with flannel:**
+**Network ([network.tf](../infra/cluster/network.tf)), following Oracle's reference layout for OKE with flannel:**
 
 ```
 VCN 10.0.0.0/16 ("the building")
@@ -919,7 +933,7 @@ automatically):
 **Tradeoff (public API endpoint):** much simpler than a private endpoint + bastion host, at the cost of a
 slightly larger attack surface (still authenticated).
 
-**Cluster ([cluster.tf](infra/cluster/cluster.tf)):**
+**Cluster ([cluster.tf](../infra/cluster/cluster.tf)):**
 
 - OKE `BASIC_CLUSTER` (free control plane), Kubernetes **v1.36.1** pinned (a rebuild next week gives the same
   cluster; upgrades are a deliberate one-line change). Will switch to `ENHANCED_CLUSTER` for Workload
@@ -949,7 +963,7 @@ uv run --env-file .env uvicorn gateway.main:app --reload        # gateway on :80
 uv run --env-file .env python scripts/client.py                 # end-to-end test (needs GATEWAY_API_KEY)
 ```
 
-[scripts/client.py](scripts/client.py) uses the **real Anthropic SDK** with only `base_url` and `api_key`
+[scripts/client.py](../scripts/client.py) uses the **real Anthropic SDK** with only `base_url` and `api_key`
 changed (and `max_retries=0`, so every failure is visible and no retry adds an extra usage row). It checks:
 a normal request, a streamed request, a wrong key (expects `AuthenticationError` 401), and a bad model (expects
 `BadRequestError` 400). If it passes unchanged, the gateway is a true drop-in for the Claude API.
@@ -999,7 +1013,8 @@ path.
 | `k8s/db-init.yaml` is a copy of `db/` | Can drift from the real migrations | CI check, or a migration Job, when the next migration lands. |
 | `db-init` only runs on an empty data folder | New migrations don't apply to an existing cluster DB | Same: a migration Job. |
 | In-cluster Postgres, 1 replica, no backups | Pod restart = seconds of downtime; lost PVC = lost data | Managed database for real data. |
-| Image tag `gateway:dev`, `imagePullPolicy: Never` | Rebuilds need a manual `rollout restart` | CI with SHA-tagged images in GHCR (next step). |
+| Canary smoke test runs once, at 25% | A bug that shows only on real traffic during the pauses reaches 100% | Metrics-based background analysis (Project 4). |
+| Canary split by pod count | Per connection, smallest step 25% with 4 pods | Ingress with traffic weights for exact or 1% steps. |
 | ConfigMap changes don't restart pods | Env vars are read once at start | `rollout restart`, or hashed ConfigMap names (Kustomize). |
 
 ---

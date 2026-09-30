@@ -8,6 +8,7 @@
 
 import json
 import logging
+import time
 from datetime import datetime
 from decimal import Decimal
 
@@ -97,6 +98,9 @@ class StreamUsage:
         self.stopped = False           # message_stop arrived: the stream ended normally
         self.errored = False           # the provider sent an error event mid-stream
         self.chars_delivered = 0       # for the estimate if the final count never comes
+        # perf_counter() when the first content arrived: time to first token.
+        # Not message_start, which comes before the model writes anything.
+        self.first_content_at: float | None = None
         self._partial_line = b""
 
     def feed(self, chunk: bytes) -> None:
@@ -117,6 +121,8 @@ class StreamUsage:
                 self.input_tokens = usage.get("input_tokens")
                 self.output_tokens = usage.get("output_tokens")
             elif kind == "content_block_delta":
+                if self.first_content_at is None:
+                    self.first_content_at = time.perf_counter()
                 delta = event["delta"]
                 # text for answers, partial_json for tool calls, thinking for reasoning
                 for field in ("text", "partial_json", "thinking"):
@@ -154,7 +160,7 @@ async def finish_buffered(
     status_code: int,
     body: bytes,
     latency_ms: int,
-) -> int:
+) -> tuple[int, int]:
     # A normal (non-streamed) reply: we read the whole body, so it's complete.
     input_tokens, output_tokens, provider_cost = read_usage(status_code, body)
     return await finish(
@@ -173,8 +179,8 @@ async def finish(
     output_tokens: int | None,
     provider_cost: Decimal | None,
     outcome: str,
-) -> int:
-    """Writes the row; returns the call's total tokens, for the monthly quota."""
+) -> tuple[int, int]:
+    """Writes the row; returns (input, output) tokens for the quota and metrics."""
     try:
         await pool.execute(
             """
@@ -198,4 +204,4 @@ async def finish(
         # for. The row keeps status_code NULL, so this call still shows up as
         # "started, never finished".
         log.exception("metering: finishing usage_event %s failed", event_id)
-    return (input_tokens or 0) + (output_tokens or 0)
+    return input_tokens or 0, output_tokens or 0

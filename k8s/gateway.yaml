@@ -69,7 +69,13 @@ spec:
           # (With a reused tag like :latest this would run stale code.)
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 8000
+            - name: http
+              containerPort: 8000
+            # Prometheus scrapes this directly on each pod (step 2). The
+            # Services below only forward 8000, so metrics (tenant ids,
+            # usage) never leave the cluster through them.
+            - name: metrics
+              containerPort: 9100
           envFrom:
             - configMapRef:
                 name: gateway-config

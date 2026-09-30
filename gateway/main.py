@@ -18,7 +18,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from gateway import auth, forwarding, limits, metering, streaming
+from gateway import auth, forwarding, limits, metering, metrics, streaming
 from gateway.db import DB_ERRORS
 
 
@@ -31,6 +31,7 @@ async def lifespan(app: FastAPI):
     app.state.db = await asyncpg.create_pool(os.environ["DATABASE_URL"])
     redis_client = limits.create_client()
     app.state.limiter = limits.Limiter(redis_client)
+    metrics.start_server()
     yield
     await redis_client.aclose()
     await app.state.db.close()
@@ -38,6 +39,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="LLM Gateway", lifespan=lifespan)
+# Counts every /v1/messages request once, whichever return path it takes.
+app.add_middleware(metrics.MetricsMiddleware)
 
 
 def error_response(
@@ -110,6 +113,8 @@ async def messages(request: Request) -> Response:
         # would help an attacker probe which keys exist.
         return error_response(401, "authentication_error", "invalid x-api-key")
     tenant_id = tenant["id"]
+    # For MetricsMiddleware's labels (it reads them when the response ends).
+    request.state.tenant_id = tenant_id
     # The call's one start time. Everything that asks "which month is this
     # call in?" (quota hold, usage row, settling) uses this same value.
     started_at = datetime.now(timezone.utc)
@@ -122,6 +127,7 @@ async def messages(request: Request) -> Response:
     except limits.LIMIT_ERRORS:
         return error_response(503, "api_error", "rate limiter unavailable")
     if wait is not None:
+        metrics.record_rejection(tenant_id, "rate_limit")
         # retry-after tells the caller's SDK exactly how long to back off.
         return error_response(
             429, "rate_limit_error", "rate limit exceeded", headers={"retry-after": str(wait)}
@@ -135,6 +141,7 @@ async def messages(request: Request) -> Response:
     model = payload.get("model")
     if not isinstance(model, str):
         model = None
+    request.state.model = model
 
     # The "card hold": reserve the estimated tokens now, so requests arriving
     # at the same moment see them as used. Needs the body, for the estimate.
@@ -145,6 +152,7 @@ async def messages(request: Request) -> Response:
     except limits.LIMIT_ERRORS:
         return error_response(503, "api_error", "rate limiter unavailable")
     if hold is None:
+        metrics.record_rejection(tenant_id, "monthly_quota")
         return error_response(
             429,
             "rate_limit_error",
@@ -202,8 +210,9 @@ async def messages(request: Request) -> Response:
 
     # Errors are metered too: "tenant X got 200 errors today" is exactly what
     # a usage table should show.
-    tokens = await metering.finish_buffered(
+    input_tokens, output_tokens = await metering.finish_buffered(
         db, event_id, model, response.status_code, response.body, latency_ms
     )
-    await limiter.settle(tenant_id, started_at, hold, tokens)
+    metrics.record_tokens(tenant_id, model, input_tokens, output_tokens)
+    await limiter.settle(tenant_id, started_at, hold, input_tokens + output_tokens)
     return response

@@ -15,7 +15,7 @@ import httpx
 from starlette.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 
-from gateway import forwarding, limits, metering
+from gateway import forwarding, limits, metering, metrics
 
 
 def is_event_stream(upstream: httpx.Response) -> bool:
@@ -93,7 +93,9 @@ class MeteredStream(StreamingResponse):
                 # generating, so a caller who leaves stops costing money.
                 await self.upstream.aclose()
                 input_tokens, output_tokens = self.meter.usage()
-                tokens = await metering.finish(
+                if self.meter.first_content_at is not None:
+                    metrics.record_ttft(self.model, self.meter.first_content_at - self.started)
+                input_tokens, output_tokens = await metering.finish(
                     self.db,
                     self.event_id,
                     self.model,
@@ -104,8 +106,10 @@ class MeteredStream(StreamingResponse):
                     self.meter.provider_cost,
                     self._outcome(),
                 )
+                metrics.record_tokens(self.tenant_id, self.model, input_tokens, output_tokens)
                 # Estimated tokens count too: a disconnect mustn't be a way
                 # around the quota any more than around billing.
                 await self.limiter.settle(
-                    self.tenant_id, self.started_at, self.quota_hold, tokens
+                    self.tenant_id, self.started_at, self.quota_hold,
+                    input_tokens + output_tokens,
                 )

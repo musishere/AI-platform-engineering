@@ -87,6 +87,8 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 
 **Status (2026-09-29):** OKE deploy deferred until funded (free ARM workers are OUT_OF_HOST_CAPACITY in Mumbai, and I'm not paying). Meanwhile Argo CD, CI/CD and canary are built on a local minikube cluster ($0); switching to OKE later means pointing Argo CD at the new cluster.
 
+**Status (2026-09-30):** CI/CD done on minikube: build → Trivy scan → push to GHCR → tag commit → Argo CD → Argo Rollouts canary (25% → smoke test → 50% → 100%). Remaining Project 3 items (OKE cluster, Workload Identity) are blocked on OCI capacity/funding.
+
 **What to build**
 - [x] Terraform: remote state (Object Storage), done first so no paid resource is ever tracked only on my laptop
 - [x] Terraform: VCN (OCI's VPC)
@@ -96,7 +98,7 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 - [x] CI/CD pipeline: build
 - [x] CI/CD pipeline: scan
 - [x] CI/CD pipeline: push
-- [ ] CI/CD pipeline: canary release
+- [x] CI/CD pipeline: canary release
 
 **What I'll learn**
 - VCN layout (subnets, routing) for an OKE cluster
