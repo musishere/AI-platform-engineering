@@ -1,0 +1,79 @@
+# Argo CD Application: the monitoring stack (Prometheus, Grafana,
+# Alertmanager), installed from the kube-prometheus-stack Helm chart.
+#
+# Argo CD renders the chart itself, so there's no helm CLI and no hand-run
+# `helm install`: the chart version and every setting live here, in Git.
+# Applied once by hand, like argocd/gateway.yaml:
+#   kubectl apply -f argocd/monitoring.yaml
+# ponytail: editing this file needs a re-apply by hand; an "app of apps"
+# (an Application that syncs argocd/) removes that step if apps multiply.
+#
+# The gateway's own scrape rule is NOT here: it's k8s/gateway-podmonitor.yaml,
+# next to the gateway, so the app's monitoring changes with the app.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    # Pinned: a chart upgrade changes Prometheus, Grafana and the CRDs at
+    # once, so it should be a deliberate, reviewable one-line change.
+    targetRevision: 91.8.2
+    helm:
+      valuesObject:
+        prometheus:
+          prometheusSpec:
+            # By default this Prometheus only picks up monitors labelled with
+            # its own Helm release. Off, so it reads every PodMonitor /
+            # ServiceMonitor / rule in the cluster, including the gateway's.
+            podMonitorSelectorNilUsesHelmValues: false
+            serviceMonitorSelectorNilUsesHelmValues: false
+            ruleSelectorNilUsesHelmValues: false
+            # 3 days is plenty to learn on, and keeps its disk and RAM small.
+            retention: 3d
+            resources:
+              requests: {cpu: 100m, memory: 400Mi}
+              limits: {memory: 1Gi}
+        grafana:
+          # Admin login from a Secret we create by hand (never in Git):
+          #   kubectl create secret generic grafana-admin -n monitoring \
+          #     --from-literal=admin-user=admin --from-literal=admin-password="$(openssl rand -hex 16)"
+          # Without this the chart invents a random password on every render
+          # (Helm's `lookup` can't reuse the old one under Argo CD), so the
+          # checksum changed each time and Grafana restarted every ~1-2 min.
+          admin:
+            existingSecret: grafana-admin
+            userKey: admin-user
+            passwordKey: admin-password
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 256Mi}
+        alertmanager:
+          alertmanagerSpec:
+            resources:
+              requests: {cpu: 10m, memory: 32Mi}
+              limits: {memory: 64Mi}
+        # On minikube these control-plane parts only listen on localhost, so
+        # Prometheus can't reach them and they'd fire "target down" alerts
+        # forever. On OKE, Oracle runs the control plane and we can't scrape
+        # it either. Off, so every alert we see is a real one.
+        kubeEtcd: {enabled: false}
+        kubeControllerManager: {enabled: false}
+        kubeScheduler: {enabled: false}
+        kubeProxy: {enabled: false}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # The chart's CRDs are too big for client-side apply (the same 256 KB
+      # annotation limit we hit installing Argo CD and Argo Rollouts).
+      - ServerSideApply=true

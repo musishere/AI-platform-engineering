@@ -1,0 +1,26 @@
+# PodMonitor: tells Prometheus "scrape every gateway pod's /metrics".
+#
+# Not a Prometheus config file: the Prometheus operator (from the monitoring
+# stack, argocd/monitoring.yaml) watches objects like this and writes the
+# scrape config itself. Lives here, next to the gateway, so the app's
+# monitoring is deployed and versioned together with the app.
+#
+# PodMonitor, not ServiceMonitor: it scrapes each pod directly on port 9100,
+# with no Service in between. The gateway Services only expose 8000, on
+# purpose, so metrics (tenant ids, usage) never leave through them.
+#
+# Needs the monitoring stack installed first: before that, Kubernetes doesn't
+# know the PodMonitor kind and Argo CD's sync of k8s/ would fail.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: gateway
+  namespace: llm-gateway
+spec:
+  selector:
+    matchLabels:
+      app: gateway      # stable and canary pods alike
+  podMetricsEndpoints:
+    - port: metrics     # the named port in gateway.yaml, not a hard-coded 9100
+      path: /metrics
+      interval: 15s

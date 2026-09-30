@@ -109,7 +109,7 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 
 **Done when**
 - [ ] `terraform apply` from scratch brings up the VCN and OKE cluster, with state stored remotely
-- [ ] A merge to main builds, scans and pushes an image, and Argo CD rolls it out as a canary
+- [x] A merge to main builds, scans and pushes an image, and Argo CD rolls it out as a canary
 - [ ] The gateway pod reaches OCI through Workload Identity, with no static credentials
 
 **Write-up**
@@ -122,7 +122,7 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 **Goal:** Know when the gateway is unhealthy before tenants notice.
 
 **What to build**
-- [ ] Prometheus metrics from the gateway
+- [x] Prometheus metrics from the gateway
 - [ ] Grafana dashboards
 - [ ] OpenTelemetry traces across the request path
 - [ ] SLOs for the gateway
