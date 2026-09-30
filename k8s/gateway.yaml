@@ -22,6 +22,12 @@ spec:
       # Rollouts points this Service at the canary pods only, so the smoke
       # test hits the NEW version, never the stable one.
       canaryService: gateway-canary
+      # Never go below 4 serving pods during a rollout: an old pod leaves
+      # only once its replacement is ready. The default (25%) let an old pod
+      # go first, and we watched capacity drop to 3 at each step (2026-09-29).
+      # Cost: each step needs one extra pod's room while it overlaps.
+      maxUnavailable: 0
+      maxSurge: 1
       # ponytail: split is per connection, not per request (a client that
       # keeps its connection open sticks to one version). Add an ingress
       # with weights (trafficRouting) for exact or tiny (1%) percentages.
