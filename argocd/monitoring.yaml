@@ -49,9 +49,11 @@ spec:
             existingSecret: grafana-admin
             userKey: admin-user
             passwordKey: admin-password
+          # 256Mi was OOMKilled as soon as the UI was opened (it loads the
+          # stack's ~30 bundled dashboards). 512Mi is a normal size for this.
           resources:
-            requests: {cpu: 50m, memory: 128Mi}
-            limits: {memory: 256Mi}
+            requests: {cpu: 50m, memory: 256Mi}
+            limits: {memory: 512Mi}
         alertmanager:
           alertmanagerSpec:
             resources:
