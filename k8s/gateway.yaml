@@ -63,7 +63,7 @@ spec:
         - name: gateway
           # Written by CI (.github/workflows/gateway.yml) on every merge to
           # main: one tag per commit. Don't edit by hand; merge code instead.
-          image: ghcr.io/musishere/ai-platform-engineering/gateway:6f6cc8c702fbebb9217cac40f344205b7b1fd286
+          image: ghcr.io/musishere/ai-platform-engineering/gateway:2e42873e3032aae15acec444827bcf8f66536d2c
           # Safe only because tags are never reused: a SHA tag always means
           # the same bytes, so a copy already on the node is the right one.
           # (With a reused tag like :latest this would run stale code.)
