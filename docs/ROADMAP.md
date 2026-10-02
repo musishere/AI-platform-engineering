@@ -124,7 +124,7 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 **What to build**
 - [x] Prometheus metrics from the gateway
 - [x] Grafana dashboards
-- [ ] OpenTelemetry traces across the request path
+- [x] OpenTelemetry traces across the request path
 - [ ] SLOs for the gateway
 - [ ] Burn-rate alerts on those SLOs
 
@@ -136,7 +136,7 @@ Backend engineer (~3.5 years, Lahore) working as an AI agent engineer at ByteFor
 
 **Done when**
 - [x] A Grafana dashboard shows request rate, error rate, latency and token usage per tenant
-- [ ] One request can be followed end to end in a trace
+- [x] One request can be followed end to end in a trace
 - [ ] Injecting errors fires a burn-rate alert
 
 **Write-up**
