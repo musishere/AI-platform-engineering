@@ -42,8 +42,9 @@
 - **Broke:** Grafana restarted every 1–2 min (the chart made a new random password on every render) → `existingSecret`; Grafana OOMKilled at 256 Mi when the UI opened → 512 Mi.
 - **Next:** OpenTelemetry traces.
 
-## 2026-10-02: Project 4, OpenTelemetry tracing (code written, not deployed yet)
+## 2026-10-02: Project 4, OpenTelemetry tracing (deployed)
 - **Built:** `gateway/tracing.py` (OTel SDK, auto spans for FastAPI/httpx/asyncpg/redis, named spans for auth, limits and metering, tenant.id and pod name on traces); Tempo single-binary via `argocd/tempo.yaml`; a Tempo data source in Grafana.
 - **Learned:** spans are pushed in batches (unlike Prometheus, which pulls); tracing fails open (dropped spans never fail a call); free-form values are fine on traces but not as metric labels; skip `/health` and per-chunk spans or the noise buries real traces.
-- **Broke:** nothing yet. The Tempo chart had moved from `grafana` to `grafana-community` (deprecated in January 2026).
-- **Next:** start minikube, apply `argocd/tempo.yaml` + `argocd/monitoring.yaml`, push, and follow one request end to end in Grafana Explore.
+- **Broke:** CI's Trivy gate blocked the deploy on fixed HIGH CVEs in the base image's OpenSSL/pcre2 (not our new packages: 0 findings there) → `apt-get upgrade` in the Dockerfile. Argo CD's monitoring app showed `Unknown` after the cluster restart (its repo-server wasn't up yet) → hard refresh. The Tempo chart had moved to `grafana-community`.
+- **Verified:** canary rolled out healthy; Grafana's Tempo data source reports OK; a real 401 call shows up as a trace (auth.find_tenant → SELECT, with the pod name). The full happy path still needs a call with a cluster tenant key.
+- **Next:** follow one successful call end to end in Grafana, tick the roadmap box, then SLOs.
