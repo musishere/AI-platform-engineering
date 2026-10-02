@@ -22,6 +22,11 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 FROM python:3.12-slim
+# Install Debian's security fixes now, not when the python image is next
+# rebuilt: on 2026-10-02 Trivy blocked the deploy on fixed OpenSSL/pcre2
+# CVEs that the base image didn't have yet. Costs some repeatability (a
+# rebuild can pull newer OS packages); worth it for same-day patches.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 # Non-root user: if someone breaks into the gateway process, they don't get
 # root inside the container. A fixed UID lets Kubernetes enforce runAsNonRoot.
 RUN useradd --system --uid 10001 app
