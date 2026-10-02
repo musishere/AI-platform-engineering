@@ -1,0 +1,50 @@
+# Argo CD Application: Grafana Tempo, the database that stores traces.
+#
+# The gateway pushes spans here (OTLP over HTTP, port 4318), and Grafana reads
+# them back (port 3200) through the data source in argocd/monitoring.yaml.
+# Same pattern as monitoring.yaml: a Helm chart that Argo CD renders, every
+# setting in Git. Applied once by hand:
+#   kubectl apply -f argocd/tempo.yaml
+#
+# Single-binary mode: one pod does receiving, storing and querying. The
+# "distributed" chart splits that into ~8 pods that scale separately, which
+# only pays off at far more traffic than a learning cluster has.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: tempo
+  namespace: argocd
+spec:
+  project: default
+  source:
+    # grafana-community, not grafana: Grafana deprecated the single-binary
+    # chart in its own repo (Jan 2026) and the community took it over.
+    repoURL: https://grafana-community.github.io/helm-charts
+    chart: tempo
+    # Pinned, for the same reason as the monitoring chart.
+    targetRevision: 3.1.0
+    helm:
+      valuesObject:
+        tempo:
+          # Traces are big (every step of every request), so keep only a day.
+          # Enough to debug "that slow call an hour ago".
+          retention: 24h
+          # Don't send usage stats about this install to Grafana Labs.
+          reportingEnabled: false
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 512Mi}
+        # ponytail: no disk, so traces vanish when the pod restarts. Fine for
+        # 24h of debugging; turn persistence on (a PVC) once traces must
+        # survive restarts, e.g. on OKE.
+        persistence:
+          enabled: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

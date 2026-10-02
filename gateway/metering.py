@@ -15,6 +15,7 @@ from decimal import Decimal
 import asyncpg
 
 from gateway.db import DB_ERRORS
+from gateway.tracing import tracer
 
 log = logging.getLogger("gateway.metering")
 
@@ -28,6 +29,7 @@ PRICES_PER_MTOK = {
 MILLION = Decimal(1_000_000)
 
 
+@tracer.start_as_current_span("metering.start")
 async def start(
     pool: asyncpg.Pool, tenant_id: int, model: str | None, started_at: datetime, quota_hold: int
 ) -> int:
@@ -169,6 +171,7 @@ async def finish_buffered(
     )
 
 
+@tracer.start_as_current_span("metering.finish")
 async def finish(
     pool: asyncpg.Pool,
     event_id: int,

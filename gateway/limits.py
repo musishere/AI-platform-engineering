@@ -16,6 +16,8 @@ from datetime import datetime, timedelta
 import asyncpg
 import redis.asyncio as redis
 
+from gateway.tracing import tracer
+
 log = logging.getLogger("gateway.limits")
 
 # Token bucket ("ticket jar"), run inside Redis as one atomic step. Doing
@@ -132,6 +134,7 @@ class Limiter:
         self._reserve = client.register_script(RESERVE)
         self._add_if_exists = client.register_script(ADD_IF_EXISTS)
 
+    @tracer.start_as_current_span("limits.rate_limit")
     async def rate_limit(self, tenant: asyncpg.Record) -> int | None:
         """None if a ticket was taken, else seconds until the next ticket."""
         wait = float(
@@ -144,6 +147,7 @@ class Limiter:
         # exactly that long finds a ticket.
         return math.ceil(wait) if wait > 0 else None
 
+    @tracer.start_as_current_span("limits.reserve")
     async def reserve(
         self, db: asyncpg.Pool, tenant: asyncpg.Record, started_at: datetime, estimate: int
     ) -> int | None:
@@ -189,6 +193,7 @@ class Limiter:
             self._quota_key(tenant_id, started_at), used, nx=True, ex=QUOTA_KEY_TTL
         )
 
+    @tracer.start_as_current_span("limits.settle")
     async def settle(
         self, tenant_id: int, started_at: datetime, hold: int, actual: int
     ) -> None:

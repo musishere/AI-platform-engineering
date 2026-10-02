@@ -92,6 +92,15 @@ spec:
                 secretKeyRef:
                   name: gateway-secrets
                   key: DATABASE_URL
+            # The pod's own name, stamped on every span it sends, so a slow
+            # trace shows which pod served it (canary or stable). Kubernetes
+            # fills it in at start (the "downward API").
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: k8s.pod.name=$(POD_NAME)
           securityContext:
             allowPrivilegeEscalation: false
           # All probes use /health, which never touches the DB. A DB blip

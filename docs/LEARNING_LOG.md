@@ -29,3 +29,21 @@
 - **Learned:** CI builds artifacts, Argo CD only deploys manifests (code is invisible to it; the tag commit is the link); unique SHA tags make `IfNotPresent` safe; GITHUB_TOKEN commits don't trigger workflows (no loop); `paths` filter means k8s-only changes skip CI; Argo CD polls every ~3 min; secrets never go through chat (leaked PAT → revoked).
 - **Broke:** new gateway pod crashed once at startup: Postgres's exec readiness probe used the 1s default timeout, flapped under node load (68× in 5h), dropped out of the Service → connection refused. Fixed with `timeoutSeconds: 5` on Postgres and Redis probes.
 - **Next:** verify quota rebuild after the Redis restart with a real call, then canary release (Argo Rollouts).
+
+## 2026-09-29/30: Project 3, canary releases (Argo Rollouts)
+- **Built:** the gateway is a Rollout, not a Deployment: 4 pods so each canary step is 25%, a `gateway-canary` Service that points only at new pods, a smoke test (own file, so CI's `sed` doesn't rewrite its image), automatic rollback if it fails. Startup probe plus 3s probe timeouts; `maxUnavailable: 0`, `maxSurge: 1`.
+- **Learned:** without a traffic router the split IS the pod count; a rolling update only checks `/health`, so a buggy version reaches 100%; the startup probe holds off liveness until boot finishes; CRDs over 256 KB need server-side apply.
+- **Broke:** liveness judged pods from second 0 with a 1s timeout and killed all 4 booting gateways; the default `maxUnavailable: 25%` dropped capacity to 3 pods during canary steps.
+- **Next:** Project 4, Prometheus metrics.
+
+## 2026-09-30/10-01: Project 4, metrics + Grafana dashboard
+- **Built:** `gateway/metrics.py` (requests, duration, TTFT, tokens, 429s, in-flight) on its own port 9100; kube-prometheus-stack via Argo CD; a PodMonitor; a per-tenant Grafana dashboard (rate, 5xx %, p50/95/99, TTFT, tokens/min, 429s).
+- **Learned:** Prometheus pulls; label cardinality (only known values become labels, unknown models become "other"); a raw ASGI middleware sees the real last byte of a stream; LLM-sized histogram buckets (up to 120s).
+- **Broke:** Grafana restarted every 1–2 min (the chart made a new random password on every render) → `existingSecret`; Grafana OOMKilled at 256 Mi when the UI opened → 512 Mi.
+- **Next:** OpenTelemetry traces.
+
+## 2026-10-02: Project 4, OpenTelemetry tracing (code written, not deployed yet)
+- **Built:** `gateway/tracing.py` (OTel SDK, auto spans for FastAPI/httpx/asyncpg/redis, named spans for auth, limits and metering, tenant.id and pod name on traces); Tempo single-binary via `argocd/tempo.yaml`; a Tempo data source in Grafana.
+- **Learned:** spans are pushed in batches (unlike Prometheus, which pulls); tracing fails open (dropped spans never fail a call); free-form values are fine on traces but not as metric labels; skip `/health` and per-chunk spans or the noise buries real traces.
+- **Broke:** nothing yet. The Tempo chart had moved from `grafana` to `grafana-community` (deprecated in January 2026).
+- **Next:** start minikube, apply `argocd/tempo.yaml` + `argocd/monitoring.yaml`, push, and follow one request end to end in Grafana Explore.

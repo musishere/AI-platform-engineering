@@ -11,3 +11,8 @@ data:
   # "redis" is the Service name: cluster DNS turns it into the Redis pod's
   # stable address, so this never needs a pod IP.
   REDIS_URL: redis://redis:6379/0
+  # Where the gateway pushes trace spans (gateway/tracing.py): Tempo's OTLP
+  # HTTP port, in the monitoring namespace. Unset = tracing off.
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo.monitoring:4318
+  # The name traces are filed under in Tempo.
+  OTEL_SERVICE_NAME: gateway

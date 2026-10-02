@@ -9,6 +9,8 @@ import secrets
 
 import asyncpg
 
+from gateway.tracing import tracer
+
 # The prefix makes a key recognisable by eye and by secret scanners (e.g.
 # GitHub's), so a key pasted somewhere public gets caught.
 KEY_PREFIX = "gw_"
@@ -27,6 +29,7 @@ def hash_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
 
+@tracer.start_as_current_span("auth.find_tenant")
 async def find_tenant(pool: asyncpg.Pool, key: str | None) -> asyncpg.Record | None:
     # Returns the tenant's id plus its limits, or None for an unknown key.
     # One query for both, so adding limits cost no extra round trip.

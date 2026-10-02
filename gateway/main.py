@@ -17,8 +17,9 @@ import asyncpg
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from opentelemetry import trace
 
-from gateway import auth, forwarding, limits, metering, metrics, streaming
+from gateway import auth, forwarding, limits, metering, metrics, streaming, tracing
 from gateway.db import DB_ERRORS
 
 
@@ -36,11 +37,18 @@ async def lifespan(app: FastAPI):
     await redis_client.aclose()
     await app.state.db.close()
     await app.state.upstream.aclose()
+    if tracer_provider:
+        # Send the last batch of spans before the pod exits, or the final
+        # few seconds of traces would be lost on every deploy.
+        tracer_provider.shutdown()
 
 
 app = FastAPI(title="LLM Gateway", lifespan=lifespan)
 # Counts every /v1/messages request once, whichever return path it takes.
 app.add_middleware(metrics.MetricsMiddleware)
+# Wraps every request in a trace (see tracing.py). Here, not in lifespan: the
+# app's middleware must be in place before the first request arrives.
+tracer_provider = tracing.setup(app)
 
 
 def error_response(
@@ -115,6 +123,10 @@ async def messages(request: Request) -> Response:
     tenant_id = tenant["id"]
     # For MetricsMiddleware's labels (it reads them when the response ends).
     request.state.tenant_id = tenant_id
+    # On the trace too, so Grafana can find "tenant 3's slow calls". Fine on a
+    # trace, unlike a metric label: each trace is stored once, so a
+    # free-form value doesn't multiply into new time series.
+    trace.get_current_span().set_attribute("tenant.id", tenant_id)
     # The call's one start time. Everything that asks "which month is this
     # call in?" (quota hold, usage row, settling) uses this same value.
     started_at = datetime.now(timezone.utc)
@@ -142,6 +154,8 @@ async def messages(request: Request) -> Response:
     if not isinstance(model, str):
         model = None
     request.state.model = model
+    if model:
+        trace.get_current_span().set_attribute("llm.model", model)
 
     # The "card hold": reserve the estimated tokens now, so requests arriving
     # at the same moment see them as used. Needs the body, for the estimate.

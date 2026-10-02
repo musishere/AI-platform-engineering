@@ -54,6 +54,15 @@ spec:
           resources:
             requests: {cpu: 50m, memory: 256Mi}
             limits: {memory: 512Mi}
+          # Lets Grafana show traces from Tempo (argocd/tempo.yaml) next to
+          # Prometheus's metrics: Explore -> Tempo, search by tenant.id.
+          additionalDataSources:
+            - name: Tempo
+              type: tempo
+              uid: tempo
+              # "tempo" is the Service name; .monitoring is its namespace.
+              url: http://tempo.monitoring:3200
+              access: proxy
         alertmanager:
           alertmanagerSpec:
             resources:
