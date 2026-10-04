@@ -1,12 +1,12 @@
 # CLAUDE.md: Learning project context
 
 ## What this repo is
-This is my personal LEARNING project, not a production product. The goal is to learn AI platform engineering by building, following ROADMAP.md (8 projects that grow one LLM gateway platform). Learning matters more than speed or finished code.
+This is my personal LEARNING project, not a production product. The goal is to become a Senior Applied AI Engineer by building, following ROADMAP.md (an LLM gateway, then a RAG app, evals, an agent, security and cost work that all call Claude through that gateway). ai_engineering_senior_roadmap.md is the theory reference (modules M1–M30); each project lists which modules to study alongside it. Learning matters more than speed or finished code.
 
-All project files live in `llm-gateway/` (run commands from there). ROADMAP.md and LEARNING_LOG.md are in `llm-gateway/docs/`. Only `.github/` (GitHub reads workflows from the repo root), `.gitignore` and this file stay at the root.
+All project files live in `llm-gateway/` (run commands from there). ROADMAP.md, LEARNING_LOG.md and ai_engineering_senior_roadmap.md are in `llm-gateway/docs/`. Only `.github/` (GitHub reads workflows from the repo root), `.gitignore` and this file stay at the root.
 
 ## Who I am
-Backend engineer with ~3.5 years of experience (Node.js, NestJS, TypeScript, Rust, Python, Postgres, Redis, AWS). I already know backend basics like async/await, REST APIs, SQL, and auth. Don't explain those. Explain the NEW concepts: infrastructure design, LLM serving, GPUs, observability, platform design, and senior-level tradeoffs.
+Backend engineer with ~3.5 years of experience (Node.js, NestJS, TypeScript, Rust, Python, Postgres, Redis, AWS). I already know backend basics like async/await, REST APIs, SQL, and auth. Don't explain those. I already build agents, guardrails and CI evals at work (ByteForge), so test me on those instead of re-teaching them. Explain the NEW concepts: RAG depth, eval rigor (statistics, judge calibration, error analysis), LLM internals, model selection and cost, and senior-level tradeoffs.
 
 ## How to explain things
 - Use simple, plain language. Short sentences. No unexplained jargon: when you use a new term, define it in one line.
