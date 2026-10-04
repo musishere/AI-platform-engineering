@@ -1,688 +1,566 @@
-# Deployment: how the gateway runs on Kubernetes
+# Deployment: how the whole platform runs
 
-> **Status (2026-09-29):** Steps 1–3 done: Argo CD deploys `k8s/` from `main` onto minikube (auto-sync, prune, selfHeal), and a real call was metered end to end. Step 4 done: a push to `main` builds, Trivy-scans and pushes `ghcr.io/…/gateway:<sha>`, CI commits the tag into `k8s/gateway.yaml`, and Argo CD rolls it out (first run 2026-09-29, ~5 min push → new pods). Step 5 done (2026-09-29): the gateway is an Argo Rollout; new versions go 25% → smoke test (fake key must get 401 from the canary pods) → 2 min → 50% → 2 min → 100%, with automatic abort if the smoke test fails. First canary: 5 min, 0 restarts.
-> The OKE deploy is paused until funded, so everything below runs on **minikube on my Mac, for $0**.
-> Moving to OKE later changes the "outside" of this picture, not the inside (see section 9).
+> **Status (2026-10-01):** everything below runs on **minikube on my Mac, for $0**. Projects 1–2 (gateway,
+> quotas) are built. Project 3 (deploy) is done except the OKE cluster itself (blocked on Oracle Cloud
+> capacity): CI builds, scans and pushes every code change, Argo CD deploys it, and Argo Rollouts releases
+> it as a canary. Project 4 (monitoring) has started: the gateway exports metrics, Prometheus scrapes them,
+> and a Grafana dashboard shows them per tenant.
+>
+> All numbers in this document (pod names, versions, IPs, counts) are real values from my cluster on this
+> date, not examples.
 
-**One-sentence version:** my gateway code is packed into an **image**, Kubernetes runs **2 copies** of it
-next to a **Postgres** and a **Redis**, and a **Service** gives them one stable address. Later, Git becomes
-the single source of truth: CI builds the image and Argo CD makes the cluster match what Git says.
+**One-sentence version:** my gateway code becomes an **image** (built by CI), Kubernetes runs **4 copies**
+of it next to **Postgres** and **Redis**, **Argo CD** keeps the cluster identical to Git, **Argo Rollouts**
+releases new versions gradually, and **Prometheus + Grafana** watch all of it.
 
-**How to read this:** Part 1 (sections 1–12) is the **map**: what exists and why. Part 2 (sections 13–22)
-is **under the hood**: what actually happens, step by step, with real output from my cluster.
-
----
-
-## 1. The nested boxes: where everything physically runs
-
-🟢 **In simple words:** a set of Russian dolls. My Mac holds a small Linux computer (Colima), which holds
-a pretend Kubernetes computer (minikube), which holds my apps. Each doll can never be bigger than the one
-it sits inside.
-
-```
-┌─ MacBook (16 GB RAM, 4 cores, macOS) ──────────────────────────────────────┐
-│                                                                            │
-│  terminal: kubectl, docker, minikube  ──────────┐  (talk to the boxes)    │
-│                                                 ▼                          │
-│  ┌─ Colima VM (Linux, 4 CPU, 6 GB) ───────────────────────────────────┐   │
-│  │   runs the Docker engine                                           │   │
-│  │                                                                    │   │
-│  │   ┌─ container "minikube" (4 CPU, 5 GB) = ONE Kubernetes node ──┐  │   │
-│  │   │   control plane: API server, scheduler, etcd                │  │   │
-│  │   │   kubelet + container runtime                               │  │   │
-│  │   │                                                             │  │   │
-│  │   │   ┌─ namespace: llm-gateway ─────────────────────────────┐  │  │   │
-│  │   │   │  gateway pod ×2    postgres pod    redis pod         │  │  │   │
-│  │   │   └──────────────────────────────────────────────────────┘  │  │   │
-│  │   └─────────────────────────────────────────────────────────────┘  │   │
-│  └────────────────────────────────────────────────────────────────────┘   │
-└────────────────────────────────────────────────────────────────────────────┘
-```
-
-🔵 **Technically:** macOS can't run Linux containers natively, so Colima runs a Linux VM with the Docker
-engine inside. Minikube's `docker` driver runs the whole Kubernetes node as **one Docker container** in
-that VM. The control plane and my pods share that one node.
-
-**Why Colima had to grow from 2 GB → 6 GB:** Kubernetes itself (~0.7 GB) + Argo CD (~0.5–1 GB) + Postgres +
-Redis + 2 gateways add up to ~2 GB before any load. Squeezed into 2 GB, pods would sit in `Pending` (no room
-to schedule them) or get `OOMKilled` (killed for running out of memory), and it would look like a bug in my
-YAML.
+**How to read this:** every concept goes 🟢 **In simple words** first, then 🔵 **Technically**. Part 1 is
+the map. Parts 2–4 are one layer each. Part 5 is for operating it: rebuild, commands, debugging, decisions.
 
 ---
 
-## 2. What runs inside the cluster
+## Table of contents
 
-🟢 **In simple words:** each app has a **manager** (Deployment) that keeps the right number of copies
-running, and a **phone number** (Service) that stays the same even when copies are replaced. Settings come
-from a **notice board** (ConfigMap) and a **locked drawer** (Secret). Postgres gets a **hard drive** (volume)
-that survives restarts.
+**Part 1: The big picture**
+1. [Where everything physically runs](#1-where-everything-physically-runs)
+2. [Inventory: every namespace and every pod](#2-inventory-every-namespace-and-every-pod)
+3. [The one idea behind everything: desired state + control loops](#3-the-one-idea-behind-everything-desired-state--control-loops)
+4. [The whole flow on one page](#4-the-whole-flow-on-one-page)
+5. [Life of one request](#5-life-of-one-request)
+
+**Part 2: Kubernetes (namespace `llm-gateway`)**
+6. [The files in `k8s/`](#6-the-files-in-k8s)
+7. [The gateway: Rollout, pods, Services](#7-the-gateway-rollout-pods-services)
+8. [Health checks: startup, liveness, readiness](#8-health-checks-startup-liveness-readiness)
+9. [Resources: requests and limits](#9-resources-requests-and-limits)
+10. [Postgres](#10-postgres)
+11. [Redis](#11-redis)
+12. [Config and Secrets](#12-config-and-secrets)
+13. [Networking: how `postgres` becomes a working connection](#13-networking-how-postgres-becomes-a-working-connection)
+14. [Storage: what "the disk survives" means](#14-storage-what-the-disk-survives-means)
+15. [Kubernetes under the hood: what happens on `apply`](#15-kubernetes-under-the-hood-what-happens-on-apply)
+
+**Part 3: Delivery (CI → Argo CD → Argo Rollouts)**
+16. [The image](#16-the-image)
+17. [CI: GitHub Actions](#17-ci-github-actions)
+18. [Argo CD: setup](#18-argo-cd-setup)
+19. [Argo CD: how it works](#19-argo-cd-how-it-works)
+20. [Argo Rollouts: canary releases](#20-argo-rollouts-canary-releases)
+21. [One code push, end to end](#21-one-code-push-end-to-end)
+
+**Part 4: Monitoring (Prometheus + Grafana)**
+22. [Why monitoring, and the three kinds of signal](#22-why-monitoring-and-the-three-kinds-of-signal)
+23. [What the gateway measures](#23-what-the-gateway-measures)
+24. [How the gateway produces its metrics (the code)](#24-how-the-gateway-produces-its-metrics-the-code)
+25. [The monitoring stack: what's installed](#25-the-monitoring-stack-whats-installed)
+26. [How Prometheus finds and scrapes the gateway](#26-how-prometheus-finds-and-scrapes-the-gateway)
+27. [How Prometheus stores data](#27-how-prometheus-stores-data)
+28. [Grafana and the gateway dashboard](#28-grafana-and-the-gateway-dashboard)
+29. [Alerting (what exists so far)](#29-alerting-what-exists-so-far)
+
+**Part 5: Operating it**
+30. [Rebuild everything from zero](#30-rebuild-everything-from-zero)
+31. [Command cheat sheet](#31-command-cheat-sheet)
+32. [Troubleshooting](#32-troubleshooting)
+33. [What broke while building this, and the fixes](#33-what-broke-while-building-this-and-the-fixes)
+34. [Decisions and tradeoffs (interview stories)](#34-decisions-and-tradeoffs-interview-stories)
+35. [Known limits](#35-known-limits)
+36. [Later: minikube → OKE](#36-later-minikube--oke)
+37. [Check yourself](#37-check-yourself)
+38. [Key terms](#38-key-terms)
+
+---
+---
+
+# Part 1: The big picture
+
+## 1. Where everything physically runs
+
+🟢 **In simple words:** Russian dolls. My Mac holds a small Linux computer (Colima), which holds a pretend
+Kubernetes computer (minikube), which holds all my apps. A doll can never be bigger than the one it sits in.
 
 ```
- namespace: llm-gateway
- ┌──────────────────────────────────────────────────────────────────────────────┐
- │                                                                              │
- │  ConfigMap gateway-config          Secret gateway-secrets                    │
- │  (not secret)                      (secret, NOT in Git)                      │
- │   UPSTREAM_BASE_URL                 UPSTREAM_API_KEY                         │
- │   REDIS_URL                         DATABASE_URL  (has the DB password)      │
- │        │                            POSTGRES_PASSWORD                        │
- │        └──────────── env vars ─────────┬──────────────────────┐              │
- │                                        ▼                      ▼              │
- │  Service "gateway" :80        Deployment "gateway"   Deployment "postgres"   │
- │   picks pods labelled   ───▶   replicas: 2            replicas: 1            │
- │   app=gateway                  ┌──────────┐           strategy: Recreate     │
- │                                │ pod  A   │           ┌──────────┐           │
- │                                │ :8000    │──┐        │ pod      │◀── Service│
- │                                └──────────┘  │ SQL    │ :5432    │  postgres │
- │                                ┌──────────┐  ├──────▶ │          │           │
- │                                │ pod  B   │  │        └────┬─────┘           │
- │                                │ :8000    │──┤             │ mounts          │
- │                                └──────────┘  │        ┌────▼──────────────┐  │
- │                                              │        │ PVC postgres-data │  │
- │                                              │        │ (disk, survives   │  │
- │  ConfigMap db-init ─── first start only ─────┼──────▶ │  pod restarts)    │  │
- │  (001…005_*.sql)                             │        └───────────────────┘  │
- │                                              │                               │
- │                                              │        Deployment "redis"     │
- │                                              └──────▶ ┌──────────┐◀── Service│
- │                                               counters│ pod :6379│   redis   │
- │                                                       │ NO disk  │           │
- │                                                       └──────────┘           │
- └──────────────────────────────────────────────────────────────────────────────┘
+┌─ MacBook (Intel, 4 cores, 16 GB, macOS) ───────────────────────────────────────────────┐
+│  terminal: kubectl, docker, minikube, uv, git                                          │
+│  browser:  Grafana (localhost:3000), Argo CD (localhost:8080) via port-forward         │
+│                                                                                        │
+│  ┌─ Colima VM (Linux, 4 CPU, 6 GB), colima 0.10.1 ─────────────────────────────────┐   │
+│  │   runs the Docker engine                                                       │   │
+│  │                                                                                │   │
+│  │   ┌─ container "minikube" = ONE Kubernetes node (k8s v1.35.1, minikube 1.38.1) ┐ │   │
+│  │   │   control plane: API server, etcd, scheduler, controller-manager           │ │   │
+│  │   │   kubelet + container runtime                                               │ │   │
+│  │   │                                                                             │ │   │
+│  │   │   ns kube-system   (6 pods)   Kubernetes itself                             │ │   │
+│  │   │   ns argocd        (7 pods)   GitOps deployer                               │ │   │
+│  │   │   ns argo-rollouts (1 pod)    canary controller                             │ │   │
+│  │   │   ns llm-gateway   (6 pods)   gateway ×4, postgres, redis   ← MY APP        │ │   │
+│  │   │   ns monitoring    (6 pods)   Prometheus, Grafana, Alertmanager, …          │ │   │
+│  │   └─────────────────────────────────────────────────────────────────────────────┘ │   │
+│  └────────────────────────────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+          ▲                                   │
+          │ git push                          │ gateway calls Claude
+     GitHub (repo, Actions, GHCR)        OpenRouter → Claude
 ```
 
-| Object | Count | What it's for |
+🔵 **Technically:** macOS can't run Linux containers natively, so **Colima** runs a Linux VM with the
+Docker engine. Minikube's `docker` driver runs the whole Kubernetes node as **one Docker container** inside
+that VM. The control plane and all my pods share that single node.
+
+**Why 6 GB for Colima:** Kubernetes (~0.7 GB) + Argo CD (~0.5–1 GB) + the monitoring stack (~1–1.5 GB) +
+Postgres + Redis + 4 gateways. Squeezed smaller, pods sit in `Pending` (no room to schedule) or get
+`OOMKilled`, and it looks like a bug in my YAML.
+
+**Things that live outside the cluster:**
+
+| Where | What |
+|---|---|
+| GitHub repo `musishere/AI-platform-engineering` | All code and manifests: the **single source of truth** |
+| GitHub Actions | CI: builds, scans and pushes the image |
+| GHCR (`ghcr.io/musishere/ai-platform-engineering/gateway`) | Private image registry |
+| OpenRouter | The upstream LLM API (routes to Claude) |
+| Oracle Cloud (`infra/`) | Terraform state bucket + budget alerts (permanent). The OKE cluster is written but not running |
+
+---
+
+## 2. Inventory: every namespace and every pod
+
+🟢 **In simple words:** a **namespace** is a folder inside the cluster. It groups related things, and
+deleting the folder deletes everything in it.
+
+🔵 **All 26 pods, by namespace** (`kubectl get pods -A`):
+
+| Namespace | Pod | Count | What it is | Installed by |
+|---|---|---|---|---|
+| **llm-gateway** | `gateway-7cc469c5ff-…` | **4** | My FastAPI gateway | Argo CD (from `k8s/`) |
+| | `postgres-…` | 1 | Tenants, usage events, quota holds | Argo CD |
+| | `redis-…` | 1 | Rate-limit buckets, quota counters | Argo CD |
+| **argocd** | `argocd-application-controller-0` | 1 | Compares Git with the cluster, applies differences | Manual bootstrap |
+| | `argocd-repo-server` | 1 | Clones Git / renders Helm charts into objects | Manual bootstrap |
+| | `argocd-server` | 1 | Web UI + API | Manual bootstrap |
+| | `argocd-redis` | 1 | Argo CD's own cache (**not** the gateway's Redis) | Manual bootstrap |
+| | `argocd-dex-server` | 1 | SSO login (unused) | Manual bootstrap |
+| | `argocd-applicationset-controller` | 1 | Generates many Applications from a template (unused) | Manual bootstrap |
+| | `argocd-notifications-controller` | 1 | Slack/email on events (unused) | Manual bootstrap |
+| **argo-rollouts** | `argo-rollouts-…` | 1 | Runs canary releases | Manual bootstrap |
+| **monitoring** | `prometheus-monitoring-kube-prometheus-prometheus-0` | 1 | Scrapes and stores metrics | Argo CD (Helm chart) |
+| | `monitoring-grafana-…` | 1 | Dashboards (3 containers: Grafana + 2 loaders) | Argo CD (Helm chart) |
+| | `alertmanager-monitoring-kube-prometheus-alertmanager-0` | 1 | Routes alerts to people | Argo CD (Helm chart) |
+| | `monitoring-kube-prometheus-operator-…` | 1 | Turns PodMonitors etc. into Prometheus config | Argo CD (Helm chart) |
+| | `monitoring-kube-state-metrics-…` | 1 | Metrics *about* Kubernetes objects | Argo CD (Helm chart) |
+| | `monitoring-prometheus-node-exporter-…` | 1 | Metrics about the node (CPU, disk, memory) | Argo CD (Helm chart) |
+| **kube-system** | `kube-apiserver`, `etcd`, `kube-scheduler`, `kube-controller-manager`, `kube-proxy`, `coredns` | 6 | Kubernetes itself (section 15) | minikube |
+
+**Total resources requested on the node:** CPU **1460m (36%)**, memory **1690 Mi (28%)**. Plenty of headroom.
+
+**Services in `llm-gateway`** (stable addresses, section 13):
+
+| Service | Cluster IP | Port → pod port | Points at |
+|---|---|---|---|
+| `gateway` | 10.97.42.26 | 80 → 8000 | **All** gateway pods (stable + canary) |
+| `gateway-canary` | 10.111.219.67 | 80 → 8000 | **Only** canary pods, during a release |
+| `postgres` | 10.110.99.166 | 5432 | The Postgres pod |
+| `redis` | 10.98.31.225 | 6379 | The Redis pod |
+
+---
+
+## 3. The one idea behind everything: desired state + control loops
+
+🟢 **In simple words:** a thermostat. You don't tell the heater "run for 20 minutes". You say "I want
+22°C". The thermostat keeps checking the room and switches the heater on or off until the room matches. If
+someone opens a window, it notices and fixes it again. It never "finishes".
+
+🔵 **Technically:** this is a **control loop** (also called **reconciliation**): *observe the actual state
+→ compare with the desired state → act on the difference → repeat forever*. Every moving part in this
+system is one of these loops, stacked on top of each other:
+
+```
+ WHAT I WANT                                                                WHAT ACTUALLY RUNS
+ ───────────                                                                ──────────────────
+ Git: k8s/*.yaml ─▶ Argo CD loop ─▶ objects in the API server ─▶ controller loops ─▶ kubelet loop ─▶ containers
+ "4 gateways,        compares Git    "Rollout gateway,          Rollouts, ReplicaSet,  starts/stops    real
+  image :2e42873"    vs cluster      replicas 4"                scheduler, endpoints   containers,     processes
+                                                                                       runs probes
+```
+
+| Loop | Watches | Desired state comes from | Acts by |
+|---|---|---|---|
+| Argo CD | Git + cluster | `k8s/` on `main` | Applying / pruning objects |
+| Argo Rollouts | Rollout objects | the Rollout's spec | Scaling two ReplicaSets, running analyses |
+| ReplicaSet controller | ReplicaSets | `replicas: N` | Creating / deleting pods |
+| Scheduler | Unscheduled pods | resource requests | Picking a node |
+| kubelet | Pods on its node | the pod spec | Starting containers, running probes, restarting |
+| Prometheus operator | PodMonitors, etc. | those objects | Rewriting Prometheus' config |
+
+**Why this matters (interview line):** *imperative* = "do these steps" (breaks if a step fails halfway).
+*Declarative* = "this is the end state" (the loops retry until it's true, and repair drift later). I never
+"start a pod": I change a number in Git and the loops make it true.
+
+---
+
+## 4. The whole flow on one page
+
+```
+                                         ┌───────────────────── GitHub ──────────────────────┐
+  me: git push (code) ─────────────────▶ │ repo main                                         │
+                                         │   │ gateway/** changed → Actions workflow         │
+                                         │   ▼                                               │
+                                         │ build image → Trivy scan → push to GHCR :<sha>    │
+                                         │   │                                               │
+                                         │   └─▶ bot commits image tag into k8s/gateway.yaml │
+                                         └───────────────────────┬───────────────────────────┘
+                                                                 │ Argo CD polls Git (~3 min)
+ ┌────────────────────────────── minikube cluster ───────────────▼────────────────────────────┐
+ │  Argo CD: "Git says :<sha>, cluster runs older" → applies the new Rollout spec             │
+ │        │                                                                                   │
+ │        ▼                                                                                   │
+ │  Argo Rollouts: 25% (1 of 4 pods) → smoke test → 2 min → 50% → 2 min → 100%                │
+ │        │               fail → abort, back to the stable version                            │
+ │        ▼                                                                                   │
+ │  kubelet pulls :<sha> from GHCR (ghcr-pull Secret) → pods run                              │
+ │        │                                                                                   │
+ │        ▼  every 15 s                                                                       │
+ │  Prometheus scrapes each gateway pod's :9100/metrics  ──▶  Grafana dashboard               │
+ └────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Each layer has one job, and none needs another's credentials:**
+
+| Layer | Job | Never does |
 |---|---|---|
-| Namespace `llm-gateway` | 1 | A folder for everything, so `kubectl delete ns llm-gateway` cleans up in one go |
-| Deployment + Service `gateway` | 2 pods | The FastAPI app from `Dockerfile` |
-| Deployment + Service `postgres` | 1 pod | Tenants, usage events, holds |
-| PersistentVolumeClaim `postgres-data` | 1 | Postgres's disk |
-| Deployment + Service `redis` | 1 pod | Rate-limit tickets + monthly quota counters |
-| ConfigMap `gateway-config` | 1 | Non-secret settings |
-| ConfigMap `db-init` | 1 | The `db/*.sql` files |
-| Secret `gateway-secrets` | 1 | API key + DB password. Created by hand, never committed |
+| CI (GitHub Actions) | Make the artifact (image) | Touch the cluster |
+| Git | Hold the desired state | Run anything |
+| Argo CD | Make the cluster match Git | Build images |
+| Argo Rollouts | Replace versions safely | Decide *what* version to run |
+| Kubernetes | Run what it's told | Know about Git or canaries |
+| Prometheus / Grafana | Measure and show | Change anything |
 
 ---
 
-## 3. Life of one request
+## 5. Life of one request
 
-🟢 **In simple words:** a tenant calls one number, gets connected to one of the gateway copies, which checks
-the key in Postgres, checks the limits in Redis, calls Claude, and writes the bill.
+A tenant calls the gateway from my Mac:
 
 ```
- my Mac                          cluster (namespace llm-gateway)                      internet
- ──────                          ───────────────────────────────                      ────────
+ my Mac                               cluster (namespace llm-gateway)                       internet
+ ──────                               ───────────────────────────────                       ────────
  Anthropic SDK / curl
-   │  POST /v1/messages
-   │  x-api-key: gw_…
+   │ POST /v1/messages, x-api-key: gw_…
    ▼
  localhost:8000
-   │  kubectl port-forward svc/gateway 8000:80
+   │ kubectl port-forward svc/gateway 8000:80   (a debugging tunnel, sticks to ONE pod)
    ▼
- Service gateway :80 ──▶ pod A :8000
-                           │ 1. hash key, look up tenant ─────▶ postgres:5432
-                           │ 2. take a ticket + hold quota ───▶ redis:6379
-                           │ 3. write "before" usage row ─────▶ postgres:5432
-                           │ 4. forward request ───────────────────────────────▶ OpenRouter
-                           │                                                     (UPSTREAM_BASE_URL)
-                           │ 5. stream reply back ◀──────────────────────────────  → Claude
-                           │ 6. settle hold, write tokens + cost ▶ postgres / redis
+ Service gateway :80 ──▶ one gateway pod :8000
+                           │ MetricsMiddleware starts the clock, in_flight +1
+                           │ 1. hash key, look up tenant ────────────────▶ postgres:5432
+                           │ 2. take a rate-limit ticket ─────────────────▶ redis:6379
+                           │ 3. hold estimated quota tokens ──────────────▶ redis:6379
+                           │ 4. write "before" usage row ─────────────────▶ postgres:5432
+                           │ 5. forward ───────────────────────────────────────────────────▶ OpenRouter
+                           │ 6. stream the reply back ◀────────────────────────────────────── → Claude
+                           │ 7. write tokens + cost, settle the quota ────▶ postgres / redis
+                           │ MetricsMiddleware: requests +1, duration observed, in_flight −1
    ◀───────────────────────┘
+                           ▲
+ Prometheus ───────────────┘ every 15 s reads pod:9100/metrics (a separate port, never via the Service)
 ```
 
-🔵 **Technically:**
-- Pods find each other through **cluster DNS**. `postgres` resolves to the `postgres` Service's stable
-  virtual IP, which forwards to whatever pod is currently behind it. That's why `DATABASE_URL` says
-  `@postgres:5432` and not a pod IP. Pod IPs change every time a pod is replaced.
-- `kubectl port-forward svc/gateway` is a debugging tunnel. It picks **one** pod and sticks to it, so it
-  does *not* spread load across A and B. Real traffic from inside the cluster, or from a load balancer on
-  OKE, does get spread by the Service.
-- Egress (traffic leaving the cluster) to OpenRouter goes Pod → node → Colima → Mac → internet. On OKE the
-  same hop would go through the NAT gateway in my private worker subnet.
+The code-level details of steps 1–7 are in [technical.md](technical.md). This document is about where and
+how it all runs.
 
 ---
-
-## 4. How code gets into the cluster: now vs. after steps 3–5
-
-### Now (steps 1–2, manual)
-
-```
- gateway/*.py ──docker build──▶ image gateway:dev ──minikube image load──▶ node's image store
-                                                                                │
- k8s/*.yaml ─────────────────────────kubectl apply -f k8s/──────────────────────▶ cluster
- .env ──────────kubectl create secret generic gateway-secrets …─────────────────▶ cluster
-```
-
-⚠️ **The `:dev` tag trap:** if I rebuild `gateway:dev` and load it again, **nothing restarts**. The
-Deployment still says `image: gateway:dev`, which hasn't changed, so Kubernetes thinks there's nothing to
-do. I'd need `kubectl rollout restart deploy/gateway`. This is exactly why CI will tag images with the
-**git commit SHA**: a new commit means a new tag, which changes the Deployment, which triggers a rollout.
-
-### Later (steps 3–5, GitOps)
-
-🟢 **In simple words:** I stop touching the cluster. I change Git. A robot builds the image, another robot
-notices Git changed and makes the cluster match. New versions first get a small slice of traffic, and only
-go to everyone if they behave.
-
-```
-  git push / merge to main
-          │
-          ▼
-  ┌─ GitHub Actions (step 4) ────────────────────────────┐
-  │  build image ──▶ scan with Trivy ──▶ push to GHCR    │   fail the scan = nothing ships
-  │                   (known CVEs?)      tag = git SHA   │
-  │  update image tag in k8s/ (commit) ──────────────────┼──┐
-  └──────────────────────────────────────────────────────┘  │
-                                                            ▼
-                                                   Git repo: k8s/*.yaml
-                                                   (the single source of truth)
-                                                            │  Argo CD polls Git
-                                                            ▼
-  ┌─ cluster ──────────────────────────────────────────────────────────────────┐
-  │  Argo CD (step 3): "Git says X, cluster has Y" ──▶ apply the difference    │
-  │                                                                            │
-  │  Argo Rollouts (step 5), canary:                                           │
-  │     new version  ─ 20% traffic ─▶ wait, check ─▶ 50% ─▶ 100%               │
-  │     looks bad?   ─▶ abort, all traffic back to old version                 │
-  └────────────────────────────────────────────────────────────────────────────┘
-```
-
-🔵 **Technically:** Argo CD is a **pull-based** deployer. It runs inside the cluster and pulls from Git, so
-CI never needs cluster credentials. A leaked CI secret can push an image, but can't directly change
-what runs. It also detects **drift**: if I `kubectl edit` something by hand, Argo CD shows it as
-`OutOfSync` and can put it back.
-
 ---
 
-## 5. Each piece, explained
+# Part 2: Kubernetes (namespace `llm-gateway`)
 
-### 5.1 Image (from `Dockerfile`)
-🟢 A sealed lunchbox: code + exact dependencies + Python, the same everywhere it's opened.
-🔵 Two stages. `uv sync --frozen` builds `.venv` in stage 1, and stage 2 copies only `.venv` + `gateway/` onto
-`python:3.12-slim`. It runs as UID 10001, not root. `.dockerignore` keeps `.env` out of the build. 228 MB.
+## 6. The files in `k8s/`
 
-### 5.2 Deployment → ReplicaSet → Pod
-🟢 The Deployment is a manager with a rule: "always 2 gateway copies of version X." If a copy dies, the
-manager replaces it.
-🔵 A Deployment owns a ReplicaSet (one per version), which owns the Pods. On a new version, it creates a new
-ReplicaSet and scales old down / new up (rolling update). Argo Rollouts in step 5 replaces this for the
-gateway with a smarter version that can pause and measure.
+Argo CD deploys **everything in this folder** into the cluster, and nothing else.
 
-**Why 2 gateway replicas:** one pod can be replaced while the other keeps serving, and canary releases in
-step 5 need more than one pod to split traffic across. The gateway keeps no state in memory (state lives
-in Postgres and Redis), so extra copies are safe.
-
-### 5.3 Service
-🟢 A phone number that never changes, even when the people answering it do.
-🔵 A stable virtual IP + DNS name (`gateway.llm-gateway.svc.cluster.local`, or just `gateway` from inside
-the namespace) that forwards to every *ready* pod matching its label selector (`app: gateway`).
-`ClusterIP` type means it's reachable only inside the cluster. On OKE, a `LoadBalancer` type or an
-Ingress would expose it publicly.
-
-### 5.4 ConfigMap vs Secret
-🟢 ConfigMap = notice board (anyone can read it). Secret = locked drawer.
-🔵 Both become env vars in the pod. The difference is permissions and handling, **not encryption**: a
-Secret is only base64-encoded (a reversible text encoding, not a lock). Anyone who can
-`kubectl get secret -o yaml` can read it. `DATABASE_URL` goes in the Secret because it contains the
-password.
-
-**Why the Secret is not in Git:** Git history is forever, and a pushed key is a leaked key. Downside:
-Argo CD can't recreate it on a fresh cluster, so that's one manual `kubectl create secret` per cluster.
-The proper fix later is an external secret store.
-
-### 5.5 PersistentVolumeClaim (Postgres's disk)
-🟢 A hard drive plugged into the Postgres pod. If the pod is replaced, the new one gets the same drive back.
-🔵 The PVC asks the default StorageClass (minikube's `storage-provisioner`, a folder on the node) for 1 Gi.
-On OKE the same PVC would be backed by an OCI Block Volume. **Recreate strategy:** the old Postgres pod is
-stopped *before* the new one starts. A rolling update would briefly run two Postgres processes on the same
-data folder, and that corrupts the database.
-
-**Why Redis gets no disk:** Project 2 already made the counters rebuildable from Postgres (real tokens +
-open holds). Losing Redis costs a short rebuild, not money. Fewer disks, fewer things to break.
-
-### 5.6 Database setup (`db-init`)
-🟢 The first time Postgres wakes up with an empty drive, it reads a folder of setup instructions.
-🔵 The official Postgres image runs every `*.sql` in `/docker-entrypoint-initdb.d/` (alphabetical order,
-hence the `001_…005_` prefixes) **only when the data folder is empty**. I mount `db/*.sql` there from the
-`db-init` ConfigMap, which is generated from `db/`.
-**Ceiling:** a future `006_*.sql` will NOT run on an existing database. When that happens, add a migration
-Job. The ConfigMap is a generated copy of `db/`, so it must be regenerated when `db/` changes.
-
-### 5.7 Probes (health checks)
-🟢 Kubernetes regularly asks the gateway "are you OK?" If it stops answering, Kubernetes restarts it.
-🔵 **Liveness** failing → the pod is restarted. **Readiness** failing → the pod is removed from the Service
-(no traffic) but not restarted. Both hit the existing `GET /health`, which deliberately does **not** touch
-the database. If it did, a 10-second Postgres blip would make every gateway pod fail liveness at once and
-get restarted together, turning a small outage into a full one.
-**Ceiling:** readiness says "ready" even when Postgres is down, so requests reach a pod that will return
-errors. Upgrade path: a separate `/ready` that checks the DB pool, used only for readiness.
-
-### 5.8 Resource requests and limits
-🟢 Request = "reserve me this much room." Limit = "never let me take more than this."
-🔵 The scheduler places pods using **requests**. Going over the memory **limit** gets the pod OOMKilled. Going
-over the CPU limit just slows it down. Small values on purpose, because everything shares one 5 GB node:
-
-| Pod | memory request / limit | CPU request |
+| File | Objects | Purpose |
 |---|---|---|
-| gateway (each) | 128Mi / 256Mi | 100m (0.1 core) |
-| postgres | 256Mi / 512Mi | 100m |
-| redis | 64Mi / 128Mi | 50m |
+| [00-namespace.yaml](../k8s/00-namespace.yaml) | Namespace `llm-gateway` | The folder for the app. `00-` so plain `kubectl apply -f k8s/` creates it first |
+| [config.yaml](../k8s/config.yaml) | ConfigMap `gateway-config` | Non-secret settings: `UPSTREAM_BASE_URL`, `REDIS_URL` |
+| [gateway.yaml](../k8s/gateway.yaml) | Rollout `gateway`, Services `gateway` + `gateway-canary` | The app itself (section 7) |
+| [gateway-smoke.yaml](../k8s/gateway-smoke.yaml) | AnalysisTemplate `gateway-smoke` | The canary's smoke test (section 20) |
+| [gateway-podmonitor.yaml](../k8s/gateway-podmonitor.yaml) | PodMonitor `gateway` | Tells Prometheus to scrape the gateway (section 26) |
+| [gateway-dashboard.yaml](../k8s/gateway-dashboard.yaml) | ConfigMap `gateway-dashboard` | The Grafana dashboard as JSON (section 28) |
+| [postgres.yaml](../k8s/postgres.yaml) | PVC + Deployment + Service `postgres` | Database (section 10) |
+| [redis.yaml](../k8s/redis.yaml) | Deployment + Service `redis` | Counters (section 11) |
+| [db-init.yaml](../k8s/db-init.yaml) | ConfigMap `db-init` | **Generated** copy of `db/*.sql`, run by Postgres on first start |
+
+**Not in Git, created by hand once per cluster** (they're secrets): `gateway-secrets`, `ghcr-pull`
+(section 12).
+
+**Why the gateway's monitoring and dashboard live in `k8s/`, not in the monitoring setup:** whoever owns
+the app owns how it's watched. A change to the gateway and a change to its dashboard go through the same
+review and the same deploy.
 
 ---
 
-## 6. Decisions and tradeoffs (interview stories)
+## 7. The gateway: Rollout, pods, Services
 
-| Decision | What I chose | What I gave up | When the other option wins |
-|---|---|---|---|
-| Local cluster | minikube (already installed) | Real cloud networking, LBs, Workload Identity | When I have budget, or need to test OCI-specific behaviour |
-| Manifest format | Plain YAML in `k8s/` | No templating, some copy-paste later | Several environments (local + OKE) → Kustomize overlays |
-| Databases | In-cluster Postgres + Redis | Backups, patching, HA | Any real data → managed DB (OCI Database / Autonomous) |
-| Postgres controller | Deployment + PVC + Recreate | StatefulSet's stable identity per replica | Multiple DB replicas (primary + standby) |
-| Redis storage | None | Counters reset on restart (rebuilt from Postgres) | If rebuild were slow or Redis held data found nowhere else |
-| Secrets | Manual `kubectl create secret` from `.env` | Full GitOps, since one object lives outside Git | Team / multiple clusters → Sealed Secrets or External Secrets + OCI Vault |
-| Schema setup | Postgres init folder | Only runs on an empty DB | The first new migration → a migration Job |
-| Image delivery | `minikube image load` now, GHCR in step 4 | Registry practice until step 4 | Any real cluster: they can't see my laptop's images |
-| Probes | Liveness + readiness on `/health` | Readiness doesn't see DB outages | Add `/ready` once traffic matters |
+### 7.1 Why a Rollout and not a Deployment
+
+🟢 A **Deployment** is a manager with one rule: "always keep N copies of version X". On a new version it
+swaps copies one by one, and only checks "does `/health` answer?". A **Rollout** is the same manager with a
+release plan: new versions get a small share first, get tested, and grow only if healthy.
+
+🔵 `kind: Rollout` (from Argo Rollouts) has the same pod template as a Deployment, plus a `strategy.canary`
+section. The Argo Rollouts controller runs it instead of Kubernetes' Deployment controller (section 20).
+
+### 7.2 Why 4 replicas
+
+- **The canary split is the pod count.** With no traffic router, the `gateway` Service picks pods at
+  random, so 1 new pod out of 4 gets about 25% of connections. 2 pods could only do 50%.
+- **Safe to run many:** the gateway keeps **no state in memory**; everything lives in Postgres and Redis.
+  Any pod can serve any request.
+- **Availability:** a pod can crash or be replaced while the others keep serving.
+
+### 7.3 The pod, piece by piece
+
+```yaml
+spec:
+  securityContext:
+    runAsNonRoot: true               # refuse to start if the image runs as root
+  imagePullSecrets:
+    - name: ghcr-pull                # login for the private GHCR image
+  containers:
+    - name: gateway
+      image: ghcr.io/musishere/ai-platform-engineering/gateway:<git-sha>   # written by CI
+      imagePullPolicy: IfNotPresent
+      ports:
+        - name: http      containerPort: 8000     # the API
+        - name: metrics   containerPort: 9100     # Prometheus metrics
+      envFrom: gateway-config (ConfigMap)          # UPSTREAM_BASE_URL, REDIS_URL
+      env: UPSTREAM_API_KEY, DATABASE_URL (from Secret gateway-secrets)
+      securityContext:
+        allowPrivilegeEscalation: false
+      startupProbe / livenessProbe / readinessProbe  → section 8
+      resources: requests 100m CPU / 128Mi, limit 256Mi  → section 9
+```
+
+| Setting | Why |
+|---|---|
+| `image: …:<git-sha>` | One tag per commit. A new commit = a new tag = a changed pod template = a rollout. A reused tag like `:dev` or `:latest` changes nothing, so nothing would roll out |
+| `imagePullPolicy: IfNotPresent` | Use the copy already on the node if there is one. **Safe only because SHA tags are never reused**: the same tag always means the same bytes |
+| `imagePullSecrets: ghcr-pull` | The image is private. This is the kubelet's login to GHCR |
+| `runAsNonRoot` + UID 10001 in the Dockerfile | If someone breaks into the process, they aren't root in the container |
+| `allowPrivilegeEscalation: false` | The process can't gain more rights than it started with |
+| Two named ports | `http` for callers, `metrics` for Prometheus. Only `http` is behind the Services |
+| Only 2 keys from the Secret | The gateway doesn't need `POSTGRES_PASSWORD` on its own. Least privilege |
+
+### 7.4 The two Services
+
+```
+Service "gateway"         selector: app=gateway                       → ALL gateway pods (callers use this)
+Service "gateway-canary"  selector: app=gateway                       → same, EXCEPT during a release:
+                                   + rollouts-pod-template-hash=<new>    Rollouts adds this line, so it
+                                                                         matches ONLY the new pods
+```
+
+- Both are `ClusterIP`: reachable only inside the cluster. From my Mac I use `kubectl port-forward`.
+- Both forward only **port 80 → 8000**. Port 9100 (metrics) is **not** exposed through them, so tenant
+  usage data can never leave through a Service (or, later, the public load balancer on OKE).
+- `gateway-canary` exists only so the smoke test can reach **only** the new version (section 20).
 
 ---
 
-## 7. What could go wrong (and how I'd spot it)
+## 8. Health checks: startup, liveness, readiness
 
-| Symptom (`kubectl get pods -n llm-gateway`) | Likely cause | First thing to check |
+🟢 **In simple words:** three questions Kubernetes keeps asking each pod:
+
+| Probe | Question | If it fails |
 |---|---|---|
-| `Pending` | Not enough CPU/memory left on the node | `kubectl describe pod …` → Events: `Insufficient memory` |
-| `ErrImagePull` / `ImagePullBackOff` | Image not loaded into minikube, or wrong tag | `minikube image ls \| grep gateway` |
-| `CrashLoopBackOff` (gateway) | Missing env var (`KeyError: 'UPSTREAM_API_KEY'`) or DB unreachable at startup | `kubectl logs -n llm-gateway -l app=gateway --prefix` |
-| `CreateContainerConfigError` | Secret `gateway-secrets` doesn't exist yet | `kubectl get secret -n llm-gateway` |
-| `OOMKilled` in `describe` | Memory limit too low | Raise the limit, or find the leak |
-| Tables missing | `db-init` didn't run because the volume already had data | `kubectl exec deploy/postgres -- psql -U gateway -c '\dt'` |
-| Code change not live | Same `:dev` tag, so no rollout | Restart the Rollout (section 10) |
-| 401 on every call | New database = no tenants yet | Create a tenant inside the cluster (section 10) |
+| **Startup** | "Have you finished booting?" | Keep waiting (up to a limit), then restart |
+| **Liveness** | "Are you still alive?" | **Kill and restart** the container |
+| **Readiness** | "Can you take traffic right now?" | **Remove from the Service** (no traffic), no restart |
+
+🔵 **The gateway's probes** (all call `GET /health` on port 8000):
+
+| Probe | Every | Timeout | Fails after | Effect |
+|---|---|---|---|---|
+| startup | 2 s | 3 s | 30 tries = **60 s** | Liveness and readiness are **off** until this passes once |
+| liveness | 10 s | 3 s | 3 misses (~30 s) | Container restarted |
+| readiness | 5 s | 3 s | 1 miss | Pod removed from `gateway` Service until it passes |
+
+**Why `/health` never touches the database:** if it did, a 10-second Postgres blip would fail liveness on
+**all 4** gateways at once, and Kubernetes would restart them together, turning a small outage into a full
+one.
+
+**Why the startup probe exists** (learned the hard way, section 33): without it, liveness judged pods from
+second 0. When 4 pods booted at once on the busy node, they took longer than 30 s, and Kubernetes **killed
+healthy pods mid-boot**. The startup probe gives up to 60 s to boot, then hands over to liveness for fast
+detection.
+
+**Why 3 s timeouts, not the default 1 s:** on a busy node, even a healthy process can take more than 1 s to
+answer. The 1 s default caused both the gateway kills and Postgres/Redis flapping.
+
+**Postgres and Redis** have readiness probes only (`pg_isready`, `redis-cli ping`), every 5 s, with a
+**5 s** timeout, raised from the 1 s default after Postgres flapped out of its Service 68 times in 5 hours.
+
+**Known limit:** readiness stays "ready" while Postgres is down, so requests still reach pods that will
+answer 503. Upgrade path: a separate `/ready` endpoint that checks the DB pool, used only for readiness.
 
 ---
 
-## 8. Startup order (and why it doesn't matter much)
+## 9. Resources: requests and limits
 
-Kubernetes starts everything at once, with no "wait for Postgres" step. The gateway might start before
-Postgres is ready, fail to open its DB pool in `lifespan`, and crash. Kubernetes then restarts it with a
-growing delay (`CrashLoopBackOff`), and within a few tries Postgres is up and the gateway starts fine.
-That's normal Kubernetes behaviour: **crash and retry instead of carefully ordering the startup**. The only
-cost is a few noisy restarts in the first minute.
+🟢 **Request** = "reserve me this much room". **Limit** = "never let me take more than this".
 
----
+🔵
+- The **scheduler** places pods using **requests** (a pod is `Pending` if no node has room for its requests).
+- Going over the **memory limit** gets the container killed: `OOMKilled`, exit code 137.
+- Going over a **CPU limit** only slows it down (throttling). I set no CPU limits on purpose, so pods can
+  use idle CPU.
 
-## 9. Later: minikube → OKE (what changes)
+| Pod | CPU request | Memory request / limit |
+|---|---|---|
+| gateway (each of 4) | 100m | 128 Mi / 256 Mi |
+| postgres | 100m | 256 Mi / 512 Mi |
+| redis | 50m | 64 Mi / 128 Mi |
+| Prometheus | 100m | 400 Mi / 1 Gi |
+| Grafana | 50m | 256 Mi / **512 Mi** (was 256 Mi → OOMKilled, section 33) |
+| Alertmanager | 10m | 32 Mi / 64 Mi |
 
-```
-                    minikube (now, $0)              OKE (when funded)
-                    ──────────────────              ─────────────────
- where it runs      container in Colima             ARM/AMD VMs in private subnet
- cluster created by minikube start                  terraform apply (infra/cluster)
- image comes from   minikube image load → GHCR      GHCR (or OCI Registry)
- public access      kubectl port-forward            Service type LoadBalancer → OCI LB
-                                                    in the public LB subnet
- Postgres disk      folder on the node              OCI Block Volume
- cloud permissions  none needed                     Workload Identity (no static keys)
- k8s/*.yaml         ─────────────── mostly the SAME files ───────────────
- Argo CD            points at minikube              points at OKE (same Git repo)
-```
-
-That bottom row is the payoff of GitOps: the deploy definitions don't care which cluster runs them.
+**Lesson:** limits are guesses until you watch real use. When a pod restarts unexpectedly, check
+`kubectl get pod … -o jsonpath='{.status.containerStatuses[*].lastState.terminated.reason}'` first. It says
+`OOMKilled` or `Error`, which splits the problem in half immediately.
 
 ---
 
-## 10. Command cheat sheet
+## 10. Postgres
 
+🟢 The gateway's filing cabinet: tenants, API key hashes, limits, and one row per call.
+
+🔵 Three objects in [postgres.yaml](../k8s/postgres.yaml):
+
+| Object | Setting | Why |
+|---|---|---|
+| PVC `postgres-data` | 1 Gi, `ReadWriteOnce`, StorageClass `standard` | A disk that outlives the pod (section 14) |
+| Deployment `postgres` | `postgres:17-alpine`, **major version pinned** | A new major changes the on-disk format and can't read the old data folder |
+| | `strategy: Recreate` | Stop the old pod **before** starting the new one. A rolling update would briefly run two Postgres processes on the same data folder, which corrupts it. Cost: a few seconds of downtime per update |
+| | `PGDATA=/var/lib/postgresql/data/pgdata` | A subfolder, because some disks have `lost+found` at their root and Postgres refuses to start in a non-empty folder |
+| | `db-init` ConfigMap at `/docker-entrypoint-initdb.d` | Postgres runs these `.sql` files in name order, **only when the data folder is empty** |
+| | readiness `pg_isready`, 5 s timeout | The Service only sends traffic once Postgres accepts connections |
+| Service `postgres` | port 5432 | Stable address: `DATABASE_URL` says `@postgres:5432` |
+
+**Schema setup (`db-init`):** [db-init.yaml](../k8s/db-init.yaml) is **generated** from `db/*.sql`:
 ```bash
-# Boxes
-colima start --cpu 4 --memory 6                  # the Linux VM (Docker engine)
-minikube start --driver=docker --cpus=4 --memory=5g
-minikube stop                                    # free the RAM when done; the cluster is kept
-
-# Image: CI builds and pushes it on every merge to main (step 4). By hand only
-# to try something before pushing (then restart the Rollout, see below):
-docker build -t gateway:dev .
-minikube image load gateway:dev
-
-# GHCR pull secret (once per cluster; never committed). The token is a GitHub
-# classic PAT with ONLY read:packages: it can pull images, nothing else.
-kubectl create secret docker-registry ghcr-pull -n llm-gateway \
-  --docker-server=ghcr.io --docker-username=musishere --docker-password=<PAT>
-
-# Secret (once per cluster, from .env; never committed)
-# New random DB password each fresh cluster; the API key is copied from .env.
-kubectl apply -f k8s/00-namespace.yaml
-PW=$(openssl rand -hex 16); KEY=$(grep '^UPSTREAM_API_KEY=' .env | cut -d= -f2-)
-kubectl create secret generic gateway-secrets -n llm-gateway \
-  --from-literal=POSTGRES_PASSWORD="$PW" \
-  --from-literal=DATABASE_URL="postgresql://gateway:$PW@postgres:5432/gateway" \
-  --from-literal=UPSTREAM_API_KEY="$KEY"
-
-# Deploy + look
-kubectl apply -f k8s/
-kubectl get pods -n llm-gateway -w
-kubectl logs -n llm-gateway -l app=gateway --prefix -f   # all gateway pods
-kubectl describe pod -n llm-gateway <pod>        # the "Events" section explains most failures
-
-# Use it
-kubectl port-forward -n llm-gateway svc/gateway 8000:80
-kubectl exec -n llm-gateway svc/gateway -- python -m gateway.create_tenant acme
-
-# Canary (the gateway is an Argo Rollout, not a Deployment, since step 5)
-kubectl get rollout gateway -n llm-gateway -w       # phase: Progressing / Paused / Healthy / Degraded
-kubectl describe rollout gateway -n llm-gateway     # current step, canary vs stable, why it aborted
-kubectl get analysisrun,job -n llm-gateway          # smoke tests and their Jobs
-kubectl logs -n llm-gateway job/<smoke-job>         # the 5 requests and PASS/FAIL
-# Restart all gateway pods (the Rollout's version of `rollout restart`)
-kubectl patch rollout gateway -n llm-gateway --type merge -p "{\"spec\":{\"restartAt\":\"$(date -u +%FT%TZ)\"}}"
-
-# Clean slate (deletes the Postgres data too)
-kubectl delete namespace llm-gateway
+kubectl create configmap db-init -n llm-gateway --from-file=db/ --dry-run=client -o yaml > k8s/db-init.yaml
 ```
+**Known limit:** a future `006_*.sql` will **not** run on an existing database (the folder isn't empty).
+When the first new migration lands, add a migration Job.
+
+**In-cluster on purpose:** $0 and simple. With real data you'd use a managed database (backups, patching,
+failover done for you).
 
 ---
 
-## 11. Check yourself
+## 11. Redis
 
-**Q1.** I rebuild the image with a bug fix, run `minikube image load gateway:dev`, and the bug is still there. Why?
-<details><summary>Answer</summary>
-The Deployment's spec didn't change (still `gateway:dev`), so Kubernetes sees nothing to roll out and the
-old pods keep running the old image. Fix now: `kubectl rollout restart`. Fix properly: unique tags per
-commit (step 4). See section 4.
-</details>
+🟢 The gateway's fast shared scoreboard: rate-limit "ticket jars" and monthly quota counters.
 
-**Q2.** Postgres goes down for 20 seconds. What happens to the 2 gateway pods, and why is that the behaviour we want?
-<details><summary>Answer</summary>
-Nothing restarts, because `/health` doesn't touch the database, so liveness keeps passing. Requests during
-those 20 seconds fail (auth can't look up tenants, so it fails closed), and then everything recovers on its
-own. If liveness checked the DB, both pods would be restarted together, and after Postgres came back
-they'd still be in restart back-off, so the outage would last longer. See 5.7.
-</details>
+🔵 [redis.yaml](../k8s/redis.yaml): `redis:8-alpine`, 1 replica, Service `redis:6379`, and **no disk at
+all** (`--save "" --appendonly no`).
 
-**Q3.** Why would a rolling update be dangerous for the Postgres Deployment, but fine for the gateway?
-<details><summary>Answer</summary>
-A rolling update starts the new pod before stopping the old one. For the gateway that's the goal (no
-downtime, no shared state). For Postgres it means two database processes writing to the same data folder
-on the same volume, which corrupts it. `Recreate` stops the old one first and accepts a few seconds of
-downtime. See 5.5.
-</details>
+**Why no disk:** every counter can be rebuilt from Postgres (real tokens + open quota holds, Project 2).
+Losing Redis costs a short rebuild, not money. A disk would just be one more thing to break.
 
-**Q4.** The Redis pod is deleted. Does anyone get free tokens, or get blocked unfairly?
-<details><summary>Answer</summary>
-Neither. For the few seconds before the replacement Redis pod is up, calls get 503 (Redis down → fail
-closed, my Project 2 choice). After that, Redis is reachable but empty, and the gateway rebuilds each
-counter from Postgres (real usage + open holds). No free tokens, and no unfair blocks. See 5.5.
-</details>
-
-**Q5.** Why does Argo CD pulling from Git make things safer than CI pushing with `kubectl apply`?
-<details><summary>Answer</summary>
-With pull, the cluster credentials never leave the cluster. CI only needs permission to push images and
-commit to Git. With push, CI holds admin credentials for the cluster, and a leaked CI secret means
-someone else controls production. Pull also catches drift. See section 4.
-</details>
+**What happens when Redis restarts:**
+1. For a few seconds calls get `503 rate limiter unavailable` (fail closed).
+2. Then Redis is empty: rate-limit jars start full, and each tenant's quota counter is rebuilt from Postgres
+   on their next request.
+3. Nobody gets free tokens, nobody gets blocked unfairly.
 
 ---
 
-## 12. Key terms
+## 12. Config and Secrets
 
-| Simple words | Technical term | One line |
-|---|---|---|
-| Sealed lunchbox | Image | Code + dependencies + runtime, built once, runs anywhere |
-| A running lunchbox | Container / Pod | A pod is 1+ containers sharing a network address |
-| The manager | Deployment | Keeps N pods of a version running, and rolls out new versions |
-| The phone number | Service | Stable DNS name + virtual IP in front of changing pods |
-| Notice board / locked drawer | ConfigMap / Secret | Settings injected as env vars. Secret ≠ encrypted |
-| Plugged-in hard drive | PersistentVolumeClaim | A request for storage that outlives the pod |
-| "Are you OK?" | Liveness / readiness probe | Restart it / stop sending it traffic |
-| Reserve / ceiling | Resource request / limit | What scheduling uses / what gets you OOMKilled |
-| Robot that makes the cluster match Git | Argo CD (GitOps) | Pull-based continuous delivery with drift detection |
-| Taste-test before serving everyone | Canary release | Send a small % of traffic to the new version, then expand or abort |
-| Folder for related things | Namespace | A name scope + a unit for cleanup and permissions |
+### 12.1 ConfigMap vs Secret
 
----
----
+🟢 **ConfigMap** = a notice board anyone can read. **Secret** = a locked drawer.
 
-# Part 2: Under the hood
+🔵 Both become environment variables in the pod. The difference is **permissions and handling, not
+encryption**: a Secret is only **base64-encoded** (reversible by anyone with `base64 -d`). The protection is
+**who can read it** (RBAC, Kubernetes' permission system).
 
-## 13. The one idea behind everything: "desired state" + a loop that fixes differences
+**Env vars are copied in when the container starts, then frozen.** If `gateway-config` changes in Git, Argo
+CD updates the ConfigMap, but running pods keep the old values: the pod template didn't change, so there's no
+rollout. Fix now: restart the Rollout (section 31). Proper fix later: Kustomize's `configMapGenerator`,
+which puts a content hash in the ConfigMap's name.
 
-🟢 **In simple words:** a thermostat. You don't tell the heater "turn on for 20 minutes." You say
-"I want 22°C." The thermostat keeps checking the room and switches the heater on or off until the room
-matches. If someone opens a window, it notices and fixes it again. It never "finishes."
+### 12.2 Every secret in the system
 
-🔵 **Technically:** this is a **control loop** (also called **reconciliation**): *observe actual state →
-compare with desired state → act on the difference → repeat forever*. Kubernetes is dozens of these loops.
-Argo CD is one more loop stacked on top, with Git as its "thermostat setting."
+| Secret | Namespace | Contains | Used by | Created by | If it leaks |
+|---|---|---|---|---|---|
+| `gateway-secrets` | llm-gateway | `UPSTREAM_API_KEY`, `DATABASE_URL`, `POSTGRES_PASSWORD` | gateway, postgres | Me, from `.env` + a random DB password | Someone spends my OpenRouter credit → rotate at OpenRouter |
+| `ghcr-pull` | llm-gateway | GitHub classic PAT, **only** `read:packages` | kubelet (pulling the image) | Me, from a hidden prompt | Someone can pull my image (read my code). Delete the token on GitHub |
+| `grafana-admin` | monitoring | Grafana admin user + random password | Grafana | Me, `openssl rand` | Someone can edit dashboards. Recreate it |
+| `repo-ai-platform` | argocd | SSH **deploy key** (read-only) for the repo | Argo CD repo-server | Me | Read my code. Delete the key on GitHub |
+| `argocd-initial-admin-secret` | argocd | Argo CD admin password | Me (UI login) | Argo CD install | Full control of what's deployed |
+| `argocd-secret`, `argocd-redis`, `argocd-notifications-secret` | argocd | Argo CD internals | Argo CD | Argo CD install | — |
+| Tenant API keys | — | Never stored. Postgres keeps SHA-256 hashes | Tenants | `create_tenant` prints once | A DB leak exposes no working keys |
+| `GITHUB_TOKEN` | GitHub Actions | Push to GHCR + commit the tag | CI | GitHub, per job | Dies when the job ends |
 
-```
- WHAT I WANT                                      WHAT ACTUALLY RUNS
- ───────────                                      ──────────────────
- Git: k8s/*.yaml ──(Argo CD loop)──▶ API server/etcd ──(Kubernetes loops)──▶ pods & containers
-   "2 gateways"     compares Git      "2 gateways"      Deployment ctrl,      2 real processes
-                    vs cluster,       (desired state    ReplicaSet ctrl,      on the node
-                    applies diff       stored here)     scheduler, kubelet
+**Rule:** secrets go from a terminal prompt straight into the system that needs them, **never** through Git,
+chat, or Slack. Git history is forever. A key pasted anywhere is a leaked key, so it gets revoked and
+replaced (which happened once, with the first GHCR token).
 
-   loop 1: Git ↔ cluster (Argo CD)   loop 2: object ↔ pods (controllers)   loop 3: pod ↔ container (kubelet)
-```
-
-Once this idea clicks, everything else is a detail:
-- **The 4 restarts**: kubelet's loop kept trying to make "a running gateway container" true.
-- **The self-heal test**: I changed the middle box by hand, and Argo CD's loop made it match Git again.
-- **Scaling**: I never "start a pod." I change a number and the loops make it true.
-
-**Why this matters (interview line):** imperative = "do these steps" (breaks if one step fails halfway).
-Declarative = "this is the end state" (the loops retry until it's true, and repair drift later).
+**Cost of this rule:** Argo CD can't recreate these on a fresh cluster. They're the manual steps in
+section 30. The proper fix later is an external secret store (e.g. OCI Vault + External Secrets).
 
 ---
 
-## 14. Layer 1: the image, under the hood
-
-### What `docker build -t gateway:dev .` really did
-
-```
- 1. Build context      the "." folder is sent to the Docker engine (inside Colima)
-                       MINUS everything in .dockerignore (.env, .venv, .git, infra …)
-                                          │
- 2. Stage "build"      python:3.12-slim + uv binary
-                       COPY pyproject.toml uv.lock   ← only the lock files
-                       RUN uv sync --frozen          ← creates /app/.venv
-                                          │
- 3. Stage 2 (final)    fresh python:3.12-slim
-                       useradd app (uid 10001)
-                       COPY --from=build /app/.venv  ← only the result crosses over
-                       COPY gateway/
-                       USER 10001, CMD uvicorn …
-                                          │
- 4. Tag                that final stack of layers gets the name gateway:dev
-```
-
-An image is a **stack of read-only layers**. Each Dockerfile instruction adds one. My real layers
-(`docker history gateway:dev`):
-
-```
-   size     instruction
-   0B       CMD ["uvicorn" …]        ← metadata only, no files
-   0B       USER 10001
-   131kB    COPY gateway/            ← my code: tiny, and changes often
-   39.3MB   COPY .venv               ← dependencies: big, change rarely
-   41kB     useradd app
-   ~150MB   python:3.12-slim base    ← shared with any other image on the same base
-```
-
-**Why the order matters:** Docker reuses (caches) a layer if its instruction and inputs didn't change,
-**but only until the first layer that did change**. Everything after that is rebuilt. Lock files come
-before code, so editing `gateway/main.py` rebuilds only the 131 kB layer, not the 39 MB one. If I'd written
-`COPY . .` first, every code edit would reinstall every dependency.
-
-**Why `.dockerignore` is a security control, not tidiness:** the build context is sent in full *before*
-the Dockerfile runs. Without it, `.env` reaches the engine, and one careless `COPY . .` bakes the API key
-into a layer. Layers are permanent: a later `RUN rm .env` adds a *new* layer that hides the file, while the
-old layer still contains it. Anyone who pulls the image can extract it.
-
-### Why `minikube image load` was needed: there are two Docker engines
-
-```
- Colima VM
- ├── Docker engine #1 ← `docker build` put gateway:dev HERE
- └── container "minikube" (the Kubernetes node)
-     └── Docker engine #2 ← kubelet starts pods from HERE; it can't see engine #1's images
-```
-
-`minikube image load` copies the image from #1 into #2. On a real cluster there's no shared laptop, so
-nodes pull from a **registry** (GHCR in step 4). That's why `imagePullPolicy: Never` is only a
-local-development setting.
-
----
-
-## 15. Layer 2: the cluster, under the hood
-
-### The control plane (the parts that run the loops)
-
-My cluster's real system pods (`kubectl get pods -n kube-system`):
-
-| Pod | Simple words | What it does |
-|---|---|---|
-| `kube-apiserver-minikube` | The front desk | The **only** way in. `kubectl`, controllers, Argo CD all talk to it. It checks permissions and validates objects |
-| `etcd-minikube` | The filing cabinet | A key-value database holding every object (the desired state). Lose etcd = lose the cluster's memory |
-| `kube-controller-manager-minikube` | The managers | Runs the built-in loops: Deployment, ReplicaSet, endpoints, PVC binding … |
-| `kube-scheduler-minikube` | The seating planner | Picks a node for each new pod, based on its **requests** vs free room |
-| `kube-proxy-…` | The switchboard | Programs the node's network rules so Service IPs reach pod IPs |
-| `coredns-…` | The phone book | Answers "what's the IP of `postgres`?" |
-| `storage-provisioner` | The hardware store | Makes a disk (a folder, on minikube) when a PVC asks for one |
-| *(kubelet, not a pod)* | The hands | An agent on each node that actually starts and stops containers and runs probes |
-
-### What happened when `kubectl apply -f k8s/gateway.yaml` ran: step by step
-
-```
- kubectl ──1──▶ API server ──2──▶ etcd: Deployment "gateway" (replicas: 2) stored
-                    │
-                    │ 3. Deployment controller (watching) sees a new Deployment
-                    │    → creates ReplicaSet gateway-6b778585c9  (hash of the pod template)
-                    │ 4. ReplicaSet controller: "want 2 pods, have 0" → creates 2 Pod objects
-                    │    (no node yet, status Pending)
-                    │ 5. Scheduler: "pod needs 100m CPU + 128Mi, minikube node has room"
-                    │    → writes nodeName: minikube on each pod
-                    ▼
-               kubelet on node minikube (watching for pods assigned to it)
-                 6. image gateway:dev present? (pullPolicy Never → must be, else ErrImagePull)
-                 7. reads ConfigMap gateway-config + Secret gateway-secrets → env vars
-                 8. starts the container as uid 10001 → uvicorn → lifespan() → connect to postgres
-                 9. runs readiness probe GET /health every 5s → passes → pod marked Ready
-                                    │
- 10. Endpoints controller: pod is Ready and has label app=gateway
-     → adds its IP to the EndpointSlice of Service "gateway" → it starts receiving traffic
-```
-
-**The real ownership chain** (each object has an `ownerReference` to its parent):
-
-```
- Deployment/gateway
-   └── ReplicaSet/gateway-6b778585c9          (6b778585c9 = hash of the pod template)
-         ├── Pod/gateway-6b778585c9-vqpls     ip 10.244.0.5
-         └── Pod/gateway-6b778585c9-xddqn     ip 10.244.0.14   ← the one self-heal created
-```
-
-Owners matter for cleanup: delete the Deployment and Kubernetes' garbage collector deletes the ReplicaSet,
-then the pods. A new image or env change produces a **new pod-template hash**, so a new ReplicaSet appears,
-and the rollout is the Deployment shifting pods from the old ReplicaSet to the new one.
-
-**Labels are the glue.** Nothing is linked by name. The Deployment finds its pods by `app: gateway`, and so
-does the Service. A typo in a label = a Service with no endpoints = "connection refused" with every pod
-looking healthy.
-
----
-
-## 16. Networking under the hood: how `postgres` becomes a working connection
+## 13. Networking: how `postgres` becomes a working connection
 
 ### Step 1: name → IP (CoreDNS)
 
-Inside every pod, `/etc/resolv.conf` (real, from my gateway pod):
+Inside every pod, `/etc/resolv.conf`:
 ```
-nameserver 10.96.0.10                                         ← CoreDNS's Service IP
+nameserver 10.96.0.10                                          ← CoreDNS's Service IP
 search llm-gateway.svc.cluster.local svc.cluster.local cluster.local
 ```
-The gateway asks for `postgres`. The `search` line makes the resolver try
-`postgres.llm-gateway.svc.cluster.local` first, and CoreDNS answers with the Service's IP:
-```
-postgres -> 10.110.99.166        redis -> 10.98.31.225        (real answers from inside the pod)
-```
-That's why a short name works inside the same namespace, and why another namespace would need
-`postgres.llm-gateway`.
+The gateway asks for `postgres`. The `search` line makes it try `postgres.llm-gateway.svc.cluster.local`,
+and CoreDNS answers `10.110.99.166`. A pod in another namespace would need `postgres.llm-gateway`.
 
 ### Step 2: Service IP → pod IP (kube-proxy)
 
-🟢 The Service IP is like a company's main phone number. No desk actually has that number; the
-switchboard forwards each call to someone who's in today.
+🟢 A Service IP is like a company's main phone number: no desk has that number, and the switchboard forwards
+each call to someone who's in today.
 
-🔵 **Nothing listens on 10.110.99.166.** It's a **virtual IP**. kube-proxy writes network rules (iptables)
-on the node: "packets to 10.110.99.166:5432 → rewrite the destination to one of the *ready* pod IPs in
-the EndpointSlice." The gateway Service's real EndpointSlice right now:
-```
-10.244.0.5  ready=true
-10.244.0.14 ready=true
-```
+🔵 **Nothing listens on 10.110.99.166.** It's a **virtual IP**. kube-proxy writes network rules (iptables) on
+the node: "connections to this IP:port → one of the **ready** pod IPs in the Service's EndpointSlice". For a
+Service with several pods, the choice is **random per connection** (this is what splits canary traffic).
 
-### This explains the 4 restarts exactly
+**A Service with no ready pods rejects connections immediately.** That's why "Postgres not ready yet"
+shows up in the gateway as `Connection refused` to the **Service IP**, not as a timeout.
 
-The crash log said `Connect call failed ('10.110.99.166', 5432)`, which is the **postgres Service IP**. At
-that moment the Postgres pod existed but wasn't *ready* (its image was still downloading), so the
-EndpointSlice was **empty**. For a Service with no endpoints, kube-proxy **rejects** the connection
-immediately, hence "connection refused" rather than a timeout. Then:
+### Step 3: from my Mac: `kubectl port-forward`
 
 ```
- t≈0s    gateway starts → lifespan → connect postgres → refused → process exits → container dies
- t≈10s   kubelet restarts it (back-off 10s)  → refused again
- t≈30s   restart (back-off 20s)              → refused again
- t≈70s   restart (back-off 40s)              → refused again
- t≈…     postgres pulled, pg_isready passes → added to EndpointSlice
-         restart #4 → connect OK → /health passes → Ready → Running, restarts stay at 4
+browser/curl → localhost:8000 → kubectl (on the Mac) → API server → ONE pod :8000
 ```
-The back-off doubles each time (10s, 20s, 40s … capped at 5 minutes). That's what `CrashLoopBackOff`
-means: *crashing, and waiting longer between each retry*. It's a status, not an error type.
+- It's a **debugging tunnel**, not load balancing: it picks **one pod** when it starts and sticks to it.
+- **If that pod is replaced, the tunnel dies** (this is why Grafana broke after its OOM restart). Restart the
+  port-forward.
+- `Connection refused` on `localhost` = the tunnel isn't running at all.
 
 ### Traffic leaving the cluster (to OpenRouter)
-Pod `10.244.x.x` → node → Colima VM → Mac → internet. Each hop rewrites the source address (NAT), so
-OpenRouter sees my home IP. On OKE the pods sit in a **private** subnet and leave through the NAT gateway
-built in `infra/cluster/network.tf`: out only, nothing can call in.
+
+Pod → node → Colima VM → Mac → internet. Each hop rewrites the source address (NAT). On OKE the pods sit in
+a **private** subnet and leave through the NAT gateway in `infra/cluster/network.tf`: out only, nothing can
+connect in.
 
 ---
 
-## 17. Config and Secrets under the hood
-
-**Env vars are copied in when the container starts, and then frozen.**
-If Argo CD updates `gateway-config` (say a new `UPSTREAM_BASE_URL`), the **running pods keep the old value**.
-The ConfigMap changed, but the pod template didn't, so there's no new ReplicaSet and no rollout.
-Fix now: restart the Rollout (section 10). Proper fix later: Kustomize's `configMapGenerator`
-adds a content hash to the ConfigMap's name, so a change produces a new name, which changes the pod
-template and triggers a rollout automatically.
-
-**A Secret is not encrypted, only encoded.**
-```bash
-kubectl get secret gateway-secrets -n llm-gateway -o jsonpath='{.data.POSTGRES_PASSWORD}'
-# → something like  MmJhYmMy…   (base64: anyone can decode it with `base64 -d`)
-```
-The protection is **who can read it** (RBAC, Kubernetes' permission system), not the encoding. On minikube,
-etcd stores it unencrypted on disk. Managed clusters like OKE encrypt etcd's disk for you.
-
-**Every secret in the system today:**
-
-| Secret | Where it lives | Who can use it | If it leaks |
-|---|---|---|---|
-| OpenRouter API key | `.env` on Mac → Secret `gateway-secrets` | gateway pods | Someone spends my OpenRouter credit. Rotate at OpenRouter |
-| Postgres password | Secret `gateway-secrets` only (random, never on disk) | postgres + gateway | Only reachable inside the cluster, so low risk |
-| Deploy key (private) | `~/.ssh/argocd_ai_platform` + Secret `repo-ai-platform` | Argo CD repo-server | Read my code (read-only). Delete the key in GitHub |
-| Tenant keys | Only printed once. Postgres stores SHA-256 hashes | tenants | A DB leak exposes no working keys (Project 1 design) |
-| Argo CD admin password | Secret `argocd-initial-admin-secret` | me | Full control of what's deployed. Change it / delete that Secret on a real cluster |
-
----
-
-## 18. Storage under the hood: what "the disk survives" really means
+## 14. Storage: what "the disk survives" means
 
 ```
  PVC postgres-data (1Gi, "I need a disk")
-   │  storage-provisioner sees an unbound claim
+   │  minikube's storage-provisioner sees an unbound claim
    ▼
- PV pvc-… (the actual disk) = folder /tmp/hostpath-provisioner/… on the minikube node
+ PV pvc-627bb417-… (the actual disk) = a folder on the minikube node
    │  bound 1:1 to the claim
    ▼
  mounted into the postgres pod at /var/lib/postgresql/data  (data in …/pgdata)
@@ -690,176 +568,1107 @@ etcd stores it unencrypted on disk. Managed clusters like OKE encrypt etcd's dis
 
 | I do this | Data survives? | Why |
 |---|---|---|
-| Delete the postgres **pod** | ✅ | The Deployment makes a new pod, which mounts the same PVC |
+| Delete the postgres **pod** | ✅ | A new pod mounts the same PVC |
 | Update Postgres (Recreate) | ✅ | Same PVC, old pod stops first |
+| Restart Colima / minikube | ✅ | The node's folders are kept |
 | Delete the **namespace** | ❌ | PVC deleted → PV deleted (reclaim policy `Delete`) |
 | `minikube delete` | ❌ | The whole node (and its folders) is gone |
 | Remove `postgres.yaml` from Git | ❌ | Argo CD **prune** deletes the PVC |
 
-On OKE the same PVC would create an **OCI Block Volume**, a real network disk that could even move to
-another node if Postgres's pod got rescheduled.
+**The only persistent disk in the whole cluster is Postgres's.** Redis has none on purpose. Prometheus has
+none either, so its metrics are lost when its pod restarts (section 27).
+
+On OKE the same PVC would create an **OCI Block Volume**, a real network disk.
 
 ---
 
-## 19. Argo CD under the hood
+## 15. Kubernetes under the hood: what happens on `apply`
 
-### Its parts (real pods in namespace `argocd`)
+### The control plane (`kube-system`)
+
+| Pod | Simple words | What it does |
+|---|---|---|
+| `kube-apiserver` | The front desk | The **only** way in. kubectl, controllers, Argo CD all talk to it. It checks permissions and validates objects |
+| `etcd` | The filing cabinet | Key-value database holding every object. Lose etcd = lose the cluster's memory |
+| `kube-controller-manager` | The managers | Built-in loops: Deployment, ReplicaSet, EndpointSlice, PVC binding… |
+| `kube-scheduler` | The seating planner | Picks a node for each new pod, based on its requests vs free room |
+| `kube-proxy` | The switchboard | Programs node network rules so Service IPs reach pod IPs |
+| `coredns` | The phone book | Answers "what's the IP of `postgres`?" |
+| *(kubelet, not a pod)* | The hands | An agent on the node that starts containers and runs probes |
+
+### From "Argo CD applies the Rollout" to "a pod serves traffic"
+
+```
+ Argo CD ──1──▶ API server ──2──▶ etcd: Rollout "gateway" (replicas 4, image :sha) stored
+                    │
+                    │ 3. Argo Rollouts controller (watching) sees a new pod template
+                    │    → creates ReplicaSet gateway-7cc469c5ff (hash of the template), scales it (section 20)
+                    │ 4. ReplicaSet controller: "want N pods, have fewer" → creates Pod objects (Pending)
+                    │ 5. Scheduler: "needs 100m CPU + 128Mi, node minikube has room" → assigns the node
+                    ▼
+               kubelet on node minikube
+                 6. image present? IfNotPresent → pull from GHCR with ghcr-pull if not
+                 7. reads ConfigMap gateway-config + Secret gateway-secrets → env vars
+                 8. starts the container as uid 10001 → uvicorn → lifespan (DB pool, Redis, metrics server :9100)
+                 9. startup probe every 2 s → passes → liveness + readiness take over
+                                    │
+ 10. EndpointSlice controller: pod Ready + label app=gateway → adds its IP to Service "gateway"
+     → it starts receiving traffic
+```
+
+**Ownership chain** (each object has an `ownerReference` to its parent, which is how cleanup works):
+```
+ Rollout/gateway
+   ├── ReplicaSet/gateway-7cc469c5ff   (current stable: 4 pods)
+   │     ├── Pod/gateway-7cc469c5ff-9hw94
+   │     ├── Pod/gateway-7cc469c5ff-bxth6
+   │     ├── Pod/gateway-7cc469c5ff-rzv7j
+   │     └── Pod/gateway-7cc469c5ff-zfq58
+   └── ReplicaSet/gateway-b4fc699c8    (previous version: 0 pods, kept as history)
+```
+
+**Labels are the glue.** Nothing is linked by name: the Rollout, both Services, and the PodMonitor all find
+the gateway pods by `app: gateway`. A typo in a label = a Service with no endpoints = "connection refused",
+with every pod looking healthy.
+
+### Startup order (and why it doesn't matter much)
+
+Kubernetes starts everything at once, with no "wait for Postgres". After a cluster restart, the gateway
+often boots before cluster DNS or Postgres is ready, fails in `lifespan`, exits, and gets restarted with a
+growing delay (10 s, 20 s, 40 s… = `CrashLoopBackOff`). Within a minute everything is up. The cost is 1–3
+harmless restarts on a cold start. That's normal Kubernetes: **crash and retry instead of careful ordering**.
+
+---
+---
+
+# Part 3: Delivery (CI → Argo CD → Argo Rollouts)
+
+## 16. The image
+
+🟢 A sealed lunchbox: code + exact dependencies + Python, the same wherever it's opened.
+
+🔵 [Dockerfile](../Dockerfile), two stages:
+
+```
+ 1. Build context      the repo folder MINUS .dockerignore (.env, .venv, .git, infra, *.tfvars)
+                                          │
+ 2. Stage "build"      python:3.12-slim + uv 0.11.7 (pinned)
+                       COPY pyproject.toml uv.lock      ← lock files only
+                       RUN uv sync --frozen --no-dev    ← creates /app/.venv (fails if the lock is stale)
+                                          │
+ 3. Stage 2 (final)    fresh python:3.12-slim
+                       useradd app (uid 10001)
+                       COPY --from=build /app/.venv     ← only the result crosses over (no build tools)
+                       COPY gateway/
+                       USER 10001, EXPOSE 8000, CMD uvicorn gateway.main:app
+```
+
+| Choice | Why |
+|---|---|
+| Lock files copied **before** the code | Docker caches layers until the first changed one. Editing `gateway/*.py` rebuilds only the tiny code layer, not the dependency layer |
+| Two stages | The shipped image has no uv or build tools: smaller, and fewer packages for the scanner to flag |
+| Non-root UID 10001 | A break-in doesn't get root. The fixed number lets Kubernetes enforce `runAsNonRoot` |
+| `.dockerignore` includes `.env` | **Security, not tidiness:** without it, the real API key is sent to the build and one careless `COPY . .` bakes it into a layer. Layers are permanent, and a later `rm` doesn't remove it |
+| No config baked in | `DATABASE_URL` etc. come from env vars that Kubernetes injects |
+
+**Size:** ~155 MB (it includes `prometheus-client` since Project 4).
+
+---
+
+## 17. CI: GitHub Actions
+
+File: [.github/workflows/gateway.yml](../.github/workflows/gateway.yml).
+
+### 17.1 When it runs
+
+| Trigger | Runs? | Does |
+|---|---|---|
+| Push to `main` touching `gateway/**`, `Dockerfile`, `.dockerignore`, `pyproject.toml`, `uv.lock`, or the workflow | ✅ | Build → scan → push → commit tag |
+| Pull request touching those | ✅ | Build → scan only (nothing unreviewed reaches the registry) |
+| Push touching only `k8s/`, `argocd/`, `docs/` | ❌ | Nothing: no new image is needed. Argo CD applies `k8s/` directly |
+
+### 17.2 The steps
+
+```
+checkout
+   │
+Build     docker build -t ghcr.io/musishere/ai-platform-engineering/gateway:$GITHUB_SHA .
+   │
+Scan      docker run aquasec/trivy:0.74.0 image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed <image>
+   │        a fixable HIGH/CRITICAL vulnerability → job fails → nothing is pushed or deployed
+   │  (main only from here)
+Push      docker login ghcr.io with GITHUB_TOKEN; docker push <image>   ← the exact bytes that were scanned
+   │
+Deploy    sed the image line in k8s/gateway.yaml → commit "deploy: gateway <sha7>" → pull --rebase → push
+```
+
+### 17.3 Why each piece is built this way
+
+| Choice | Why | Gave up |
+|---|---|---|
+| Scan **before** push | A vulnerable image never reaches the registry at all | — |
+| Push the scanned image, not a rebuild | A rebuild could pull a newer, unscanned base image | — |
+| `--ignore-unfixed` | A CVE with no fix yet can't be acted on; blocking on it would stop every deploy | Some known-but-unfixable CVEs ship (reported, not blocking) |
+| Tag = git SHA | Every commit is a distinct, traceable image; it changes the pod template, so it triggers a rollout | — |
+| CI commits the tag to Git | Git shows exactly what's deployed and when; rollback = `git revert` | Bot commits in history; I must `git pull --rebase` before pushing |
+| No loop | GitHub never starts workflows from commits made with `GITHUB_TOKEN`, and the commit only touches `k8s/` | — |
+| `concurrency` queued, not cancelled | Two quick merges can't race; an older build can't land last and roll the cluster back | Deploys queue |
+| `permissions: contents: write, packages: write` only | Least privilege for the job's token | — |
+| No layer cache | Simple (~1 min per build) | Add buildx with a GHA cache if builds get slow |
+| amd64 only | minikube on an Intel Mac | Add arm64 when moving to OKE's ARM workers |
+
+**CI never touches the cluster.** It has no cluster credentials. A leaked CI secret can push an image, but
+can't change what runs until Argo CD pulls a Git change.
+
+---
+
+## 18. Argo CD: setup
+
+### 18.1 Installed how
+
+```bash
+kubectl create namespace argocd
+kubectl apply -n argocd --server-side -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.3/manifests/install.yaml
+```
+- **v3.5.3, pinned.**
+- **`--server-side`:** Argo CD's CRDs (custom resource definitions, which teach Kubernetes new kinds like
+  `Application`) are too big for normal `kubectl apply`. It stores a copy of each object in an annotation
+  limited to 256 KB. Server-side apply keeps that bookkeeping in the API server instead. The same fix was
+  needed for Argo Rollouts, and inside the monitoring Application (`ServerSideApply=true`).
+
+### 18.2 Access to the private repo
+
+- A **read-only SSH deploy key** added to the GitHub repo, and its private half stored as the Secret
+  `repo-ai-platform` in `argocd`, labelled `argocd.argoproj.io/secret-type=repository`.
+- Argo CD checks GitHub's SSH host key, so a fake "github.com" can't feed it manifests.
+
+### 18.3 The two Applications
+
+An **Application** is Argo CD's "instruction card": *keep this destination identical to that source*.
+
+| Application | Source | Destination | File |
+|---|---|---|---|
+| `gateway` | Git repo, `main`, path `k8s/` | namespace `llm-gateway` | [argocd/gateway.yaml](../argocd/gateway.yaml) |
+| `monitoring` | Helm chart `kube-prometheus-stack` **91.8.2** from `prometheus-community.github.io/helm-charts` | namespace `monitoring` | [argocd/monitoring.yaml](../argocd/monitoring.yaml) |
+
+Both use:
+```yaml
+syncPolicy:
+  automated:
+    prune: true      # a file removed from Git → its object is deleted from the cluster
+    selfHeal: true   # a hand edit (kubectl edit) → reverted to what Git says
+```
+
+**The Applications themselves are applied by hand once** (`kubectl apply -f argocd/…`). That's the
+bootstrap: after it, Git drives everything. Editing an `argocd/*.yaml` file needs a re-apply by hand. An "app
+of apps" (an Application that syncs `argocd/`) would remove that step if apps multiply.
+
+### 18.4 Its parts (pods in `argocd`)
 
 | Pod | Simple words | Job |
 |---|---|---|
-| `argocd-repo-server` | The reader | Clones Git with the deploy key and turns `k8s/` into a list of objects (would also render Helm/Kustomize) |
-| `argocd-application-controller-0` | The thermostat | Compares the list from Git with the live cluster, applies differences, judges health |
-| `argocd-server` | The dashboard | Web UI + API (what `port-forward 8080:443` opens) |
-| `argocd-redis` | Its notepad | A cache for Argo CD itself. **Not** my gateway's Redis |
-| `argocd-dex-server` | SSO door | Login via GitHub/Google etc. (unused, I log in as admin) |
-| `argocd-applicationset-controller` | Card printer | Generates many Applications from one template (unused) |
-| `argocd-notifications-controller` | Messenger | Slack/email on sync events (unused) |
+| `argocd-repo-server` | The reader | Clones Git with the deploy key, renders `k8s/` and Helm charts into objects |
+| `argocd-application-controller-0` | The thermostat | Compares desired vs live, applies differences, judges health |
+| `argocd-server` | The dashboard | Web UI + API |
+| `argocd-redis` | Its notepad | A cache for Argo CD. If it's down, Argo CD is slower, not broken |
+| `argocd-dex-server`, `-applicationset-controller`, `-notifications-controller` | Extras | SSO, templated apps, notifications: unused |
 
-### One loop, step by step
+---
+
+## 19. Argo CD: how it works
+
+### 19.1 One loop, step by step
 
 ```
-                    ┌───────────────────── about every 3 min (or on a webhook, or "Refresh") ─┐
-                    ▼                                                                          │
- 1. repo-server: git fetch main over SSH (deploy key)                                         │
-    checks github.com's host key against argocd-ssh-known-hosts-cm                            │
-    (so a fake "github.com" can't feed it manifests)                                          │
- 2. renders k8s/ → DESIRED objects        (cached per commit SHA, e.g. 8cbb282)               │
-                    │                                                                          │
- 3. controller: LIVE objects ◀── it keeps a live watch on the cluster, updated instantly      │
- 4. diff DESIRED vs LIVE → sync status: Synced / OutOfSync                                    │
- 5. OutOfSync + automated → apply the difference (in a safe order, see below)                 │
-    selfHeal → also re-apply when the LIVE side drifted                                       │
-    prune    → delete LIVE objects it owns that are no longer in DESIRED                      │
- 6. health check of every object → Healthy / Progressing / Degraded / Missing ────────────────┘
+                    ┌────────────── about every 3 min (or "Refresh", or a webhook) ──────────────┐
+                    ▼                                                                             │
+ 1. repo-server: git fetch main over SSH (or download the Helm chart)                            │
+ 2. render → DESIRED objects (cached per commit SHA / chart version)                             │
+ 3. controller: LIVE objects ◀── it keeps a live watch on the cluster, updated instantly         │
+ 4. diff DESIRED vs LIVE → Synced / OutOfSync                                                    │
+ 5. OutOfSync + automated → apply the difference (Namespaces → ConfigMaps/Secrets → Services →   │
+    workloads, in a safe order)                                                                  │
+    selfHeal → also re-apply when LIVE drifted       prune → delete owned objects gone from Git  │
+ 6. health of every object → Healthy / Progressing / Degraded / Suspended / Missing ─────────────┘
 ```
 
-**Why self-heal took 4 seconds but a git push can take up to ~3 minutes:** the two sides are watched
-differently. The cluster side is a **live watch**, so the controller heard about my `kubectl scale` right away.
-The Git side is **polled** every ~3 minutes, because Argo CD has no way to know a commit happened until
-it asks. Teams add a GitHub **webhook** ("GitHub calls Argo CD when you push") to make it instant, but
-that needs Argo CD to be reachable *from* the internet, which a laptop cluster (or a private OKE cluster)
-isn't. Polling is the price of not exposing anything.
-
-### Two separate questions: "sync" vs "health"
+### 19.2 Sync vs health: two separate questions
 
 | | Question | Values |
 |---|---|---|
 | **Sync status** | Does the cluster match Git? | `Synced`, `OutOfSync` |
-| **Health status** | Is what's running actually working? | `Healthy`, `Progressing`, `Degraded`, `Missing` |
+| **Health status** | Is what runs actually working? | `Healthy`, `Progressing`, `Suspended`, `Degraded`, `Missing` |
 
-They're independent. **Synced + Degraded** = "I applied exactly what Git says, and it's broken," which is
-what a bad release looks like. It's also why Argo CD alone doesn't protect you from bad code: it faithfully
-deploys it. That's the job of the canary in step 5.
+**Synced + Degraded** = "I applied exactly what Git says, and it's broken". That's a bad release, and the
+fix belongs in Git. Argo CD alone doesn't protect you from bad code: it deploys it faithfully. That's what
+the canary is for. Argo CD understands Rollout health: `Progressing` during steps, `Healthy` when done,
+`Degraded` after an abort.
 
-For a Deployment, "Healthy" means the rollout finished and the wanted replicas are available (readiness
-probes passing). ConfigMaps and Services have no health, which is why they showed a blank.
+### 19.3 Why a hand edit is reverted in seconds, but a push takes minutes
 
-### How it "adopted" what I'd created by hand
+- The **cluster side** is a **live watch**: a `kubectl edit` is seen immediately, and selfHeal reverts it.
+- The **Git side** is **polled** every ~3 minutes (plus random jitter): Argo CD can't know a commit happened
+  until it asks.
+- To check Git **now**: `kubectl annotate application gateway -n argocd argocd.argoproj.io/refresh=normal --overwrite`
+  (the same as the Refresh button).
+- A GitHub **webhook** would make it instant, but needs Argo CD reachable from the internet, which a laptop
+  cluster (or a private OKE cluster) isn't.
 
-Argo CD marks every object it manages with an annotation (real, from my gateway Deployment):
+### 19.4 Which objects it owns (and why my Secrets are safe)
+
+Every object Argo CD manages carries an annotation like:
 ```
-argocd.argoproj.io/tracking-id: gateway:apps/Deployment:llm-gateway/gateway
-                                └app┘ └── kind ──────┘ └namespace/name┘
+argocd.argoproj.io/tracking-id: gateway:argoproj.io/Rollout:llm-gateway/gateway
 ```
-On the first sync, my hand-made objects had the same kind, namespace and name as Git, so Argo CD applied
-Git's version on top and stamped the annotation. No duplicates, no restarts. **Prune only deletes objects
-that carry this annotation**, which is why `gateway-secrets` (created by hand, never stamped) is safe.
+**Prune only deletes objects with this annotation.** Hand-made Secrets (`gateway-secrets`, `ghcr-pull`,
+`grafana-admin`) never get it, so they survive. **Risk:** deleting `postgres.yaml` from Git deletes the
+database's PVC.
 
-### Order of applying
+### 19.5 Rollback in GitOps
 
-Argo CD sorts objects by kind before applying: Namespace → Secrets/ConfigMaps → PVCs → Services →
-Deployments … So the namespace exists before anything inside it, whatever the filenames are. The `00-` prefix
-is only for plain `kubectl apply -f k8s/`, which goes alphabetically.
+| Action | Sticks? | Why |
+|---|---|---|
+| `git revert <bad commit>` + push | ✅ | Git changes, Argo CD applies it |
+| `kubectl rollout undo` / `kubectl edit` / `kubectl set image` | ❌ | selfHeal sees the cluster ≠ Git and puts Git's version back |
 
-### Its memory of what it deployed
-```
-history: id 0 → revision 8cbb282 deployed 2026-09-29T10:41:10Z
-```
-Every sync records the Git commit it deployed. A rollback in GitOps is normally `git revert` (so Git stays
-the truth). The history tells you *which* commit was live when something broke.
+### 19.6 Helm charts through Argo CD (the monitoring app)
+
+Argo CD renders the chart itself (`helm template`-style); there's no helm CLI and no `helm install`. Two
+consequences:
+1. **The chart version and every setting are in Git** (`targetRevision`, `valuesObject`).
+2. **Anything random or cluster-dependent in a chart causes endless drift.** Helm's `lookup` function
+   (read something from the live cluster) returns nothing under Argo CD. The Grafana chart used it to reuse
+   its admin password, so every render invented a new random password → new checksum → Grafana restarted
+   every 1–2 minutes. The fix: provide the password from our own Secret (`grafana.admin.existingSecret`).
 
 ---
 
-## 20. The full picture: one change, end to end (today vs. after step 4)
+## 20. Argo Rollouts: canary releases
 
-**Today, if I change `replicas: 2 → 3` in `k8s/gateway.yaml` and push:**
+### 20.1 Installed how
+
+```bash
+kubectl create namespace argo-rollouts
+kubectl apply -n argo-rollouts --server-side -f https://github.com/argoproj/argo-rollouts/releases/download/v1.10.0/install.yaml
 ```
- git push ─▶ GitHub main (new SHA)
-             ... up to ~3 min: Argo CD's next poll fetches it ...
- repo-server renders → controller diffs: Deployment.spec.replicas 2 ≠ 3 → OutOfSync
- → applies → Deployment controller → ReplicaSet wants 3 → +1 Pod → scheduler → kubelet
- → readiness passes → EndpointSlice gets a 3rd IP → Synced + Healthy, history id 1 = new SHA
+v1.10.0, pinned. One controller pod. It must exist **before** Git mentions a `Rollout`, or Argo CD can't
+apply that kind.
+
+### 20.2 Stable vs canary
+
+🟢 **Stable** = the version I already trust (the last one that reached 100%). **Canary** = the new version
+on trial. **Both serve real callers at the same time**, the canary with a small share. If the canary passes,
+it becomes the new stable. If it fails, it's removed and stable goes back to 100%.
+
+🔵 Each version is its own **ReplicaSet**, named after a hash of its pod template. A release is the
+controller turning two dials: stable pods down, canary pods up.
+
+### 20.3 The steps (from [gateway.yaml](../k8s/gateway.yaml))
+
+```yaml
+strategy:
+  canary:
+    canaryService: gateway-canary
+    maxUnavailable: 0        # never fewer than 4 serving pods during a release
+    maxSurge: 1              # up to 1 extra pod while old and new overlap
+    steps:
+      - setWeight: 25        # 1 of 4 pods is the new version
+      - analysis: {templates: [{templateName: gateway-smoke}]}
+      - pause: {duration: 2m}
+      - setWeight: 50
+      - pause: {duration: 2m}
+      # after the last step: 100%
 ```
 
-**If I change gateway *code* today:** Git alone does nothing useful. The image `gateway:dev` is built and
-loaded by hand, and the Deployment's text never changes. **This is the gap step 4 closes:** CI builds an
-image tagged with the commit SHA and commits that tag into `k8s/gateway.yaml`. Then a code change *is*
-a manifest change, and Argo CD rolls it out like the replicas example.
+### 20.4 How `setWeight` becomes traffic (two stages)
+
+**Stage 1, Rollouts does math: weight → pod counts** (both sides rounded **up**):
+```
+canary pods = ceil(replicas × weight/100)        stable pods = ceil(replicas × (100−weight)/100)
+setWeight 25 → canary ceil(1.0)=1, stable ceil(3.0)=3   → 1 of 4 = 25%
+setWeight 50 → canary 2, stable 2                       → 50%
+(10 replicas, 25% → canary ceil(2.5)=3, stable ceil(7.5)=8 → 11 pods, 3/11 ≈ 27%)
+```
+Rounding up means the canary is never 0 pods and the stable side never has less capacity than asked, at
+the cost of a temporary extra pod. 4 replicas with steps of 25 and 50 give exact whole numbers.
+
+**Stage 2, kube-proxy rolls the dice: pod counts → connections.** The `gateway` Service picks a ready pod
+**at random per connection**. It knows nothing about versions; with 1 canary pod out of 4, about 1 in 4
+connections lands there.
+
+**Consequence: the split is per connection, not per request.** An SDK client keeps its connection open,
+so one client sticks to one version. The percentage only holds on average across many connections. An
+ingress with traffic weights would split per request (and allow 1%), at the cost of one more component.
+
+### 20.5 The smoke test (analysis step)
+
+[gateway-smoke.yaml](../k8s/gateway-smoke.yaml) is an **AnalysisTemplate**. At the analysis step:
+
+```
+Rollout → creates an AnalysisRun → creates a Job → a curl pod runs:
+  5 × POST http://gateway-canary/v1/messages  with x-api-key: gw_smoke_test_not_a_real_key
+  every answer must be 401
+     exit 0 → Successful → next step
+     exit 1 → Failed     → ABORT
+```
+
+**Why 401 is the right signal:** a bad key is looked up in Postgres, so a 401 proves the new code started,
+parses requests, and **reached Postgres**. It costs $0 (it never reaches Claude) and writes no usage row. A
+503 (DB unreachable) or a 500 (bug) fails it.
+
+**Why it targets `gateway-canary`:** during a release, Rollouts adds the canary's hash to that Service's
+selector, so all 5 requests hit **only the new pods**. Through `gateway` they'd hit the old pods 75% of the
+time, and pass even with a broken canary.
+
+**Why it's in its own file:** CI's `sed` rewrites **every** `image:` line in `gateway.yaml`, and would
+overwrite the curl image.
+
+### 20.6 A real release, as observed (2026-09-29)
+
+| Time | Step | Pods (old / new) |
+|---|---|---|
+| 16:21:44 | Argo CD synced → `setWeight 25` | 4 → 3 / 1 |
+| 16:21:57 | Canary ready in 13 s (0 restarts) → smoke test: 401 ×5 → **PASS** | 3 / 1 |
+| 16:22:10 | `pause 2m` | 3 / 1 |
+| 16:24:11 | `setWeight 50` | 2 / 2 |
+| 16:24:18 | `pause 2m` | 2 / 2 |
+| 16:26:18 | Promotion to 100% | 0 / 4 |
+| 16:26:43 | **Healthy**: the new ReplicaSet is now stable | 0 / 4 |
+
+That run showed capacity dropping to 3 serving pods at each step (the default `maxUnavailable: 25%`), which
+led to `maxUnavailable: 0` (section 33).
+
+### 20.7 When it fails
+
+```
+ v1 ✅✅✅✅  →  setWeight 25: v2 pod starts (v1 stays at 4, maxUnavailable 0)
+             →  smoke test: HTTP 503 → FAIL
+             →  ABORT: v2 scaled to 0, v1 back to 4   (blast radius: ~25% of connections, seconds)
+ Argo CD: Synced + Degraded   (Git still says v2; the cluster protects callers)
+ Fix: git revert (or a fix commit) + push → a fresh canary
+```
+
+**Known gap:** the smoke test runs **once**, at 25%. A bug that only shows on real traffic during the pauses
+(e.g. 500s on streaming) isn't caught: pauses are timers, not checks. Upgrade path (Project 4): a
+**background analysis** that queries Prometheus for the canary's error rate through every step.
 
 ---
 
-## 21. What's still manual, and rebuilding from zero
+## 21. One code push, end to end
 
-Everything in Git rebuilds itself. These don't, on purpose (they're either secrets or the thing that
-starts the robot):
+The metrics release (commit `2e42873`, 2026-09-30) is the first to go through the **whole** chain from one
+push:
+
+```
+ t+0      git push (gateway/metrics.py etc.)
+ t+~3m    Actions: build → Trivy scan (incl. new prometheus-client) → push :2e42873… → bot commit 80e49a8
+ t+≤3m    Argo CD polls Git, sees the new tag, applies the Rollout
+ t+~5m    Rollouts: 25% → smoke test PASS → 2m → 50% → 2m → 100%
+          new stable ReplicaSet gateway-7cc469c5ff, 4 pods
+ total    ≈ 10 minutes, no human action after the push
+```
+
+**My only habit change:** `git pull --rebase` before my next push, because the bot commits to `main`.
+
+---
+---
+
+# Part 4: Monitoring (Prometheus + Grafana)
+
+## 22. Why monitoring, and the three kinds of signal
+
+🟢 **The goal of Project 4:** know the gateway is unhealthy **before tenants notice**. Before this, the only
+way to know how it was doing was to query Postgres by hand or read logs.
+
+| Signal | Analogy | Answers | Tool here |
+|---|---|---|---|
+| **Metrics** | A car's dashboard gauges | "How many, how fast, how often?" Cheap numbers over time | **Prometheus + Grafana** ✅ |
+| **Logs** | The driver's diary | "What exactly happened at 10:42?" | `kubectl logs` (for now) |
+| **Traces** | A parcel's tracking history | "Where did *this* request spend its 8 seconds?" | OpenTelemetry (next step) |
+
+Metrics come first: dashboards, SLOs and alerts are all built on them.
+
+### How Prometheus collects: pull, not push
+
+🟢 An **electricity meter** in each house only counts. A **meter reader** walks past every 15 seconds, reads
+each dial, and writes the number in a notebook with the time.
+
+🔵 Each gateway pod serves a plain-text page at `:9100/metrics`. Prometheus fetches it every 15 s (a
+**scrape**) and stores each number with a timestamp.
+
+**Why pull:** the gateway doesn't need to know where Prometheus is, or buffer and retry if it's down. And if a
+scrape fails, Prometheus *knows* the pod is unreachable: its `up` metric becomes 0, which is itself an alarm.
+
+---
+
+## 23. What the gateway measures
+
+### 23.1 The six metrics
+
+| Metric | Type | Labels | Answers |
+|---|---|---|---|
+| `gateway_requests_total` | Counter | tenant, model, status | Request rate and error rate, per tenant |
+| `gateway_request_duration_seconds` | Histogram | tenant, model | Latency p50/p95/p99 (a stream counts until its **last** byte) |
+| `gateway_time_to_first_token_seconds` | Histogram | model | For streams: how long until words start appearing |
+| `gateway_tokens_total` | Counter | tenant, model, direction (`input`/`output`) | Token usage per tenant |
+| `gateway_limit_rejections_total` | Counter | tenant, reason (`rate_limit`/`monthly_quota`) | Who hits our limits, and which one |
+| `gateway_requests_in_flight` | Gauge | — | How busy each pod is right now |
+
+Plus `up{namespace="llm-gateway"}`, which Prometheus creates itself for every target: 1 = scraped fine,
+0 = unreachable.
+
+### 23.2 The three metric types
+
+| Type | Analogy | Can | Used for |
+|---|---|---|---|
+| **Counter** | Odometer | Only go up (reset to 0 on restart) | Requests, tokens, rejections |
+| **Gauge** | Speedometer | Go up and down | Requests in flight |
+| **Histogram** | Sorting parcels into weight bins | Each bin only goes up | Durations |
+
+**Counters are turned into rates by Prometheus, not the gateway:**
+```
+10:00:00  gateway_requests_total = 1000
+10:05:00  gateway_requests_total = 1300     rate = (1300 − 1000) / 300 s = 1 request/second
+```
+A pod restart (every canary!) resets its counters to 0. `rate()` detects the drop and handles it, which is
+why graphs always use `rate(...)`, never the raw number.
+
+**Histograms give percentiles from bins:**
+```
+…_bucket{le="1"}    40      40 requests took ≤ 1 s
+…_bucket{le="2.5"}  85      85 took ≤ 2.5 s (includes the 40)
+…_bucket{le="5"}    97
+…_bucket{le="+Inf"} 100     all 100
+…_sum 210.5   …_count 100   (for the average)
+```
+For **p95**, the 95th request falls between `le="2.5"` (85) and `le="5"` (97), and Prometheus estimates
+inside that bin (≈ 4.6 s). That's `histogram_quantile(0.95, …)`.
+
+**My buckets:** `0.05 … 10, 20, 30, 60, 120` s for duration (the library's default stops at 10 s, but LLM
+calls often take 10–60 s, so p99 would read "more than 10 s"). TTFT: `0.1 … 30` s.
+
+### 23.3 Labels and the cardinality rule
+
+🟢 Every distinct label combination is a separate line in the meter reader's notebook, kept for days. A few
+tenants × a few models × a few status codes is fine. A label whose values **a caller can invent** grows the
+notebook without limit until Prometheus runs out of memory.
+
+🔵 The rules applied:
+- **model:** comes from the caller's request body, so it's **filtered**: only models in the price table
+  become labels; everything else is `"other"`.
+- **tenant:** our own database id, only set after the key is verified. Bad-key requests are `"none"`.
+- **status:** HTTP codes, a small fixed set.
+- **Never:** request ids, user text, raw model strings.
+- **Watch item:** `tenant` on the duration histogram = tenants × models × 13 buckets. Drop it there if
+  tenants grow into the hundreds.
+
+### 23.4 Why a separate port (9100)
+
+`/metrics` shows **tenant ids and their usage**, which is business data. The gateway Services only forward
+8000, so port 9100 is unreachable from outside the cluster (including a future public load balancer),
+without having to remember to block anything. Prometheus runs inside the cluster and scrapes each pod's IP
+on 9100 directly.
+
+---
+
+## 24. How the gateway produces its metrics (the code)
+
+Everything is in [gateway/metrics.py](../gateway/metrics.py), plus a few calls from `main.py` and
+`streaming.py`. Library: `prometheus-client` 0.26.0 (the official Python client).
+
+### 24.1 The pieces
+
+```
+ gateway/main.py
+   lifespan():   metrics.start_server()          → a tiny HTTP server on :9100, on its own thread
+   app.add_middleware(metrics.MetricsMiddleware) → counts every /v1/messages request
+   messages():   request.state.tenant_id = …     → tells the middleware who called
+                 request.state.model = …         → and which model
+                 metrics.record_rejection(…)     → at the two 429 spots (rate_limit / monthly_quota)
+                 metrics.record_tokens(…)        → after metering has the real counts
+ gateway/streaming.py (when a stream ends)
+                 metrics.record_ttft(…)          → from the first content_block_delta
+                 metrics.record_tokens(…)
+```
+
+### 24.2 The middleware: every request counted once, in one place
+
+**Problem:** `/v1/messages` has 8 ways to end (401, 503 ×3, 429 ×2, 413, reply/stream), plus crashes. A
+counter in each spot means 8 places to maintain and forget, and crashes can't be counted that way at all.
+
+**Solution:** a raw **ASGI** middleware that wraps the whole route. ASGI is the interface between uvicorn and
+FastAPI: the app sends a response as `http.response.start` (status + headers), then one or many
+`http.response.body` messages.
+
+```python
+async def __call__(self, scope, receive, send):
+    started = perf_counter(); status = 500; IN_FLIGHT.inc()
+    async def send_and_watch(message):          # our own `send`, handed to the app
+        if message["type"] == "http.response.start":
+            status = message["status"]          # note the status…
+        await send(message)                     # …pass everything through unchanged
+    try:
+        await self.app(scope, receive, send_and_watch)   # returns only after the LAST byte
+    finally:                                    # success, crash, or a streaming caller who left
+        IN_FLIGHT.dec()
+        REQUESTS.labels(tenant, model, status).inc()
+        DURATION.labels(tenant, model).observe(perf_counter() - started)
+```
+
+| Detail | Why |
+|---|---|
+| Raw ASGI, not `@app.middleware("http")` | FastAPI's version sees the response when **headers** go out, which for a 2-minute stream is second 1. Wrapping `send` stops the clock at the real last byte |
+| `status = 500` default | If the app crashes before answering, the caller gets a 500, so that's what's counted |
+| No `await` in `finally` | A cancelled task (caller disconnected) gets cancelled again at its next `await`. Plain `.inc()` calls can't be interrupted |
+| Tenant/model via `request.state` | The route writes into `scope["state"]` as it learns them; the middleware reads it at the end. Tested with a real FastAPI app, not assumed |
+| Only `/v1/messages` | `/health` is hit every few seconds by probes and would drown real traffic |
+
+### 24.3 Tokens and time to first token
+
+- `metering.finish()` returns `(input_tokens, output_tokens)`, the same counts that go to billing. The
+  metric and the bill can't disagree. Split by direction because output costs 5× input for Haiku.
+- `StreamUsage` records `perf_counter()` at the **first `content_block_delta`** (the first actual word),
+  not at `message_start`, which arrives before the model writes anything.
+
+### 24.4 How it was checked
+
+1. A self-check in `metrics.py` (`uv run python -m gateway.metrics`): unknown model → `other`, crash → 500,
+   `/health` not counted, in-flight back to 0.
+2. A real FastAPI app with the middleware: tenant/model labels arrive, and a 0.6 s stream is timed ≥ 0.6 s.
+3. The real Docker image serves all 6 metrics on `:9100/metrics`.
+4. **In the cluster:** after sending traffic, Prometheus' numbers matched the client's output exactly (6 × 200,
+   25 × 400, 8 × 429, 3 × 401, 108 input + 174 output tokens).
+
+---
+
+## 25. The monitoring stack: what's installed
+
+### 25.1 kube-prometheus-stack
+
+🟢 One package with everything needed to monitor a Kubernetes cluster, installed as a whole.
+
+🔵 The Helm chart **kube-prometheus-stack 91.8.2**, installed by the Argo CD Application `monitoring`
+([argocd/monitoring.yaml](../argocd/monitoring.yaml)) into namespace `monitoring`.
+
+| Component | Pod | Version | Job |
+|---|---|---|---|
+| **Prometheus operator** | `monitoring-kube-prometheus-operator-…` | v0.94 | Watches PodMonitor / ServiceMonitor / PrometheusRule objects and writes Prometheus' config |
+| **Prometheus** | `prometheus-monitoring-kube-prometheus-prometheus-0` | v3.15.0 | Scrapes targets every 15 s (30 s default for the stack's own targets), stores the time series, evaluates rules |
+| **Grafana** | `monitoring-grafana-…` (3 containers) | 13.2.3 | Dashboards. Two sidecar containers auto-load dashboards and data sources from ConfigMaps |
+| **Alertmanager** | `alertmanager-monitoring-kube-prometheus-alertmanager-0` | — | Receives firing alerts from Prometheus, groups them, routes them to people (step 5) |
+| **kube-state-metrics** | `monitoring-kube-state-metrics-…` | — | Metrics *about Kubernetes objects*: pod restarts, Rollout/Deployment replicas, PVC status… |
+| **node-exporter** | `monitoring-prometheus-node-exporter-…` | — | Metrics about the node: CPU, memory, disk, network |
+
+**What the chart also installed:**
+- **10 CRDs** (new Kubernetes kinds), including `PodMonitor`, `ServiceMonitor`, `PrometheusRule`,
+  `Prometheus` and `Alertmanager`.
+- **134 alerting rules + 86 recording rules** for Kubernetes health (e.g. "pod crash-looping", "node
+  memory low").
+- **25 ready-made dashboards** (Kubernetes compute per namespace/pod, node, Prometheus itself…).
+
+### 25.2 The operator pattern (the key idea)
+
+🟢 You don't edit Prometheus' config file. You create a small Kubernetes object that says "scrape these
+pods", and a robot (the **operator**) rewrites Prometheus' config for you. It's the same idea as Argo
+Rollouts: a controller that turns a custom object into real actions.
+
+🔵
+```
+ PodMonitor "gateway" (in k8s/, deployed by Argo CD)
+        │ watched by
+        ▼
+ Prometheus operator → regenerates the scrape config (a Secret) → config-reloader sidecar tells Prometheus
+        │
+        ▼
+ Prometheus starts scraping the new targets (within ~1 min)
+```
+
+### 25.3 The settings I chose (in `argocd/monitoring.yaml`)
+
+| Setting | Value | Why |
+|---|---|---|
+| `targetRevision` | `91.8.2` | Pinned: an upgrade changes Prometheus, Grafana and CRDs at once, so it should be a deliberate one-line change |
+| `podMonitorSelectorNilUsesHelmValues` (+ serviceMonitor, rule) | `false` | By default this Prometheus only reads monitors labelled with its own Helm release. Off, so it reads the gateway's PodMonitor in `llm-gateway` too |
+| `retention` | `3d` | Plenty for learning, keeps disk and RAM small |
+| Prometheus resources | 400 Mi request / 1 Gi limit | Fits the node |
+| `grafana.admin.existingSecret` | `grafana-admin` | Our own password Secret. Without it the chart made a random one on every render (restart loop, section 33) |
+| Grafana resources | 256 Mi / **512 Mi** | 256 Mi was OOMKilled when the UI opened |
+| Alertmanager resources | 32 Mi / 64 Mi | It's tiny |
+| `kubeEtcd`, `kubeControllerManager`, `kubeScheduler`, `kubeProxy` | `enabled: false` | On minikube they only listen on localhost, so Prometheus can't reach them and they'd fire "target down" forever. On OKE, Oracle runs the control plane. Off, so every alert we see is real |
+| `syncOptions: ServerSideApply=true` | | The chart's CRDs are too big for client-side apply |
+| `syncOptions: CreateNamespace=true` | | Argo CD creates `monitoring` itself |
+
+---
+
+## 26. How Prometheus finds and scrapes the gateway
+
+### 26.1 The PodMonitor
+
+[k8s/gateway-podmonitor.yaml](../k8s/gateway-podmonitor.yaml):
+```yaml
+kind: PodMonitor
+metadata: {name: gateway, namespace: llm-gateway}
+spec:
+  selector:
+    matchLabels: {app: gateway}         # stable and canary pods alike
+  podMetricsEndpoints:
+    - port: metrics                     # the NAMED port in gateway.yaml, not a hard-coded 9100
+      path: /metrics
+      interval: 15s
+```
+
+**PodMonitor, not ServiceMonitor:** a ServiceMonitor scrapes through a Service's ports, but the gateway
+Services deliberately expose only 8000. A PodMonitor scrapes each pod directly on 9100.
+
+**Order dependency:** the `PodMonitor` kind only exists once the monitoring stack is installed. The stack
+went in first, then the PodMonitor was pushed.
+
+### 26.2 What Prometheus scrapes (all 14 target groups, all up)
+
+| Target group | Targets | What it measures |
+|---|---|---|
+| `podMonitor/llm-gateway/gateway` | **4/4** | **My gateway pods** |
+| `serviceMonitor/…/kubelet` (3 endpoints) | 3 | Container CPU/memory per pod (cAdvisor), probes, kubelet itself |
+| `serviceMonitor/…/kube-state-metrics` | 1 | Kubernetes object state (restarts, replicas) |
+| `serviceMonitor/…/node-exporter` | 1 | Node CPU, memory, disk |
+| `serviceMonitor/…/apiserver` | 1 | The Kubernetes API server |
+| `serviceMonitor/…/coredns` | 1 | Cluster DNS |
+| `serviceMonitor/…/prometheus` (2) | 2 | Prometheus watching itself |
+| `serviceMonitor/…/alertmanager` (2) | 2 | Alertmanager |
+| `serviceMonitor/…/operator`, `…/grafana` | 2 | The operator and Grafana |
+
+Check it any time:
+```bash
+kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 9090:9090
+# http://localhost:9090 → Status → Targets
+```
+
+### 26.3 One scrape, step by step
+
+```
+every 15 s, for each of the 4 gateway pod IPs:
+  Prometheus → GET http://10.244.0.x:9100/metrics  (pod IP directly, no Service)
+  gateway's metrics thread answers with the text page (~200 lines)
+  Prometheus adds labels: namespace, pod, container, job, instance
+  stores each line as (series, timestamp, value)
+  sets up{pod="gateway-…"} = 1   (0 if the GET failed)
+```
+The gateway's own labels (tenant, model, status) plus Prometheus' labels (pod…) identify each series. That's
+why dashboards use `sum by (tenant)`: to add the 4 pods together.
+
+---
+
+## 27. How Prometheus stores data
+
+- **A time-series database (TSDB).** Each series is a list of `(timestamp, value)` pairs. Recent data sits in
+  memory (the "head"), older data is compacted into blocks on disk.
+- **68,377 series** right now. Almost all come from Kubernetes itself (kubelet, kube-state-metrics); the
+  gateway adds only a few hundred. Series count drives Prometheus' memory use, which is why cardinality
+  matters.
+- **Retention 3 days:** older data is deleted automatically.
+- **⚠️ No persistent disk:** Prometheus stores its data in the pod's temporary storage (no PVC). **A Prometheus
+  pod restart loses all history.** Fine for learning. Before real use, add a PVC via
+  `prometheus.prometheusSpec.storageSpec` in `argocd/monitoring.yaml`.
+- **Recording rules** (86 from the stack) pre-compute expensive queries on a schedule and store the results
+  as new series, so dashboards and alerts stay fast. The SLO step will add some for the gateway.
+
+---
+
+## 28. Grafana and the gateway dashboard
+
+### 28.1 Open it
+
+```bash
+kubectl port-forward -n monitoring svc/monitoring-grafana 3000:80
+# http://localhost:3000, user admin, password:
+kubectl get secret grafana-admin -n monitoring -o jsonpath='{.data.admin-password}' | base64 -d; echo
+```
+Then **Dashboards → LLM Gateway**. **Explore** (compass icon) runs any PromQL query ad hoc.
+
+### 28.2 How the data source and dashboards get into Grafana
+
+- **Data source:** the chart provisions "Prometheus" (uid `prometheus`) pointing at
+  `http://monitoring-kube-prometheus-prometheus.monitoring:9090/`, as the default.
+- **Dashboards:** a sidecar container in the Grafana pod watches **all namespaces** for ConfigMaps labelled
+  `grafana_dashboard: "1"` and loads their JSON. That's how the stack's 25 dashboards and mine appear.
+
+**Why the dashboard is a ConfigMap in Git** ([k8s/gateway-dashboard.yaml](../k8s/gateway-dashboard.yaml)),
+not clicked together in the UI: it's versioned and reviewed, deployed by Argo CD, and **survives a rebuild**.
+UI-only edits are lost when the Grafana pod restarts (it has no disk either). To change it: edit in the UI →
+**Export → JSON** → paste into the ConfigMap → push.
+
+### 28.3 The panels and their queries
+
+A **Tenant** dropdown at the top (`label_values(gateway_requests_total, tenant)`, multi-select, default All)
+filters every panel through `tenant=~"$tenant"`.
+
+| Panel | PromQL | Reads as |
+|---|---|---|
+| Gateway pods up | `sum(up{namespace="llm-gateway", pod=~"gateway-.*"})` | Should be 4 |
+| Requests / s | `sum(rate(gateway_requests_total{tenant=~"$tenant"}[5m]))` | Traffic, averaged over 5 min |
+| Error rate (5xx) | `100 * sum(rate(…{status=~"5.."}[5m])) / sum(rate(…[5m]))` | % of requests failing on our side or the provider's |
+| In flight | `sum(gateway_requests_in_flight)` | Rising steadily = requests piling up |
+| Request rate by tenant and status | `sum by (tenant, status) (rate(…[5m]))` | Who calls, and what they get back |
+| Error rate by tenant | the error query, `by (tenant)` | Is one tenant failing when others aren't? |
+| Latency p50/p95/p99 | `histogram_quantile(0.95, sum by (le) (rate(gateway_request_duration_seconds_bucket[5m])))` | Typical vs slow tail |
+| Time to first token p50/p95 | the same on `gateway_time_to_first_token_seconds_bucket` | Blank-screen time for streams |
+| Tokens / min by tenant | `60 * sum by (tenant, direction) (rate(gateway_tokens_total[5m]))` | Input vs output use |
+| Refused by our limits | `60 * sum by (tenant, reason) (rate(gateway_limit_rejections_total[5m]))` | rate_limit vs monthly_quota |
+
+**Why the error rate counts only 5xx:** 4xx (bad key, bad request, our own 429s) are caused by the caller or
+a limit working as designed. Counting them would make "error rate" jump every time a tenant misuses the API,
+and paging someone for that would be noise. This definition is the basis for the SLO step.
+
+**Why `[5m]` and `sum by`:** `rate(…[5m])` smooths over 5 minutes (and handles counter resets); `sum by
+(tenant)` adds up the 4 pods, which each count separately.
+
+### 28.4 Sending traffic to see it
+
+```bash
+kubectl port-forward -n llm-gateway svc/gateway 8000:80                     # terminal 1
+export GATEWAY_API_KEY=$(kubectl exec -n llm-gateway svc/gateway -- \
+  python -m gateway.create_tenant demo-$(date +%s) | tail -1)              # key never printed
+uv run python scripts/client.py                                             # ~1 cent: 200s, a stream, a 401, a 400
+for i in $(seq 30); do curl -s -o /dev/null -w "%{http_code} " -X POST localhost:8000/v1/messages \
+  -H "x-api-key: $GATEWAY_API_KEY" -H 'content-type: application/json' \
+  -d '{"model":"no-such-model","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}'; done; echo
+# → ~21 × 400 then 429s (the tenant's 20-ticket jar + 1/s refill). Free: the provider rejects the bad model.
+```
+
+---
+
+## 29. Alerting (what exists so far)
+
+```
+Prometheus evaluates alert rules every 30 s → firing alerts → Alertmanager → groups, silences, routes
+                                                                              → (no receivers configured yet)
+```
+
+- **134 alerting rules** from the stack cover Kubernetes health (crash loops, node pressure, Prometheus
+  problems…).
+- **`Watchdog` is always firing, on purpose.** It's a "dead man's switch": if it ever *stops* arriving
+  somewhere, the alerting pipeline itself is broken.
+- **No receivers yet:** alerts are visible in Alertmanager/Prometheus but not sent anywhere.
+- **Next (Project 4, step 5):** SLOs for the gateway (e.g. "99% of requests succeed") and **burn-rate
+  alerts** on them, written as a `PrometheusRule` in `k8s/`, next to the gateway.
+
+---
+---
+
+# Part 5: Operating it
+
+## 30. Rebuild everything from zero
+
+Everything in Git rebuilds itself. These steps don't, on purpose: they're secrets, or the thing that starts
+the robot.
 
 ```bash
 # 1. The boxes
 colima start --cpu 4 --memory 6
 minikube start --driver=docker --cpus=4 --memory=5g
-# 2. The image: nothing to do, CI pushed it to GHCR. Pods pull it with ghcr-pull (step 4).
-# 3. Argo CD itself (pinned version)
+
+# 2. Argo CD (pinned; --server-side because its CRDs are too big)
 kubectl create namespace argocd
 kubectl apply -n argocd --server-side -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.3/manifests/install.yaml
-# 3b. Argo Rollouts (canary controller, pinned; --server-side for the same CRD-size reason)
+
+# 3. Argo Rollouts (pinned; must exist before Git mentions a Rollout)
 kubectl create namespace argo-rollouts
 kubectl apply -n argo-rollouts --server-side -f https://github.com/argoproj/argo-rollouts/releases/download/v1.10.0/install.yaml
-# 4. Secrets (never in Git): the repo key for Argo CD, the app secrets (section 10)
+
+# 4. Argo CD's access to the private repo (read-only deploy key)
 kubectl create secret generic repo-ai-platform -n argocd --from-literal=type=git \
   --from-literal=url=git@github.com:musishere/AI-platform-engineering.git \
   --from-file=sshPrivateKey=$HOME/.ssh/argocd_ai_platform
 kubectl label secret repo-ai-platform -n argocd argocd.argoproj.io/secret-type=repository
-#    + gateway-secrets and ghcr-pull (section 10; the namespace is created by step 5, or apply 00-namespace.yaml first)
-# 5. The bootstrap: from here on, Git drives
+
+# 5. Monitoring stack first (the gateway's PodMonitor needs its CRDs)
+kubectl create namespace monitoring
+kubectl create secret generic grafana-admin -n monitoring \
+  --from-literal=admin-user=admin --from-literal=admin-password="$(openssl rand -hex 16)"
+kubectl apply -f argocd/monitoring.yaml
+#    wait until: kubectl get application monitoring -n argocd  → Synced Healthy
+
+# 6. The gateway's secrets (never in Git)
+kubectl apply -f k8s/00-namespace.yaml
+PW=$(openssl rand -hex 16); KEY=$(grep '^UPSTREAM_API_KEY=' .env | cut -d= -f2-)
+kubectl create secret generic gateway-secrets -n llm-gateway \
+  --from-literal=POSTGRES_PASSWORD="$PW" \
+  --from-literal=DATABASE_URL="postgresql://gateway:$PW@postgres:5432/gateway" \
+  --from-literal=UPSTREAM_API_KEY="$KEY"
+read -s "PAT?GHCR token (read:packages): "; echo
+kubectl create secret docker-registry ghcr-pull -n llm-gateway \
+  --docker-server=ghcr.io --docker-username=musishere --docker-password="$PAT"; unset PAT
+
+# 7. The bootstrap: from here on, Git drives
 kubectl apply -f argocd/gateway.yaml
+
+# 8. A tenant (new database = no tenants)
+kubectl exec -n llm-gateway svc/gateway -- python -m gateway.create_tenant <name>
 ```
 
-`--server-side` in step 3: Argo CD's own object definitions (CRDs, "custom resource definitions", which
-teach Kubernetes new kinds like `Application`) are too big for normal `kubectl apply`. It saves a copy of
-each object in an annotation limited to 256 KB. Server-side apply keeps that bookkeeping in the API server
-instead.
-
-On OKE, steps 1 (and eventually 3–5) become Terraform. That's the "Terraform builds the building,
-GitOps arranges the furniture" split.
+**On OKE,** step 1 becomes `terraform apply` in `infra/cluster`. "Terraform builds the building, GitOps
+arranges the furniture."
 
 ---
 
-## 22. Check yourself (Part 2)
+## 31. Command cheat sheet
 
-**Q6.** I push a new `UPSTREAM_BASE_URL` in `k8s/config.yaml`. Argo CD shows Synced + Healthy. Are the gateways using the new URL?
+```bash
+# ── Boxes ────────────────────────────────────────────────────────────────────
+colima start --cpu 4 --memory 6 && minikube start
+minikube stop                                          # free RAM; the cluster is kept
+
+# ── Look ─────────────────────────────────────────────────────────────────────
+kubectl get pods -A                                    # everything
+kubectl get pods -n llm-gateway -w                     # watch the app
+kubectl logs -n llm-gateway -l app=gateway --prefix -f # all gateway pods
+kubectl describe pod -n llm-gateway <pod>              # the Events section explains most failures
+kubectl get pod <pod> -n <ns> -o jsonpath='{.status.containerStatuses[*].lastState.terminated.reason}'
+
+# ── Use the gateway ──────────────────────────────────────────────────────────
+kubectl port-forward -n llm-gateway svc/gateway 8000:80
+kubectl exec -n llm-gateway svc/gateway -- python -m gateway.create_tenant <name>
+
+# ── Argo CD ──────────────────────────────────────────────────────────────────
+kubectl get applications -n argocd                     # sync + health of both apps
+kubectl annotate application gateway -n argocd argocd.argoproj.io/refresh=normal --overwrite   # check Git now
+kubectl port-forward -n argocd svc/argocd-server 8080:443       # UI: https://localhost:8080, user admin
+kubectl get secret argocd-initial-admin-secret -n argocd -o jsonpath='{.data.password}' | base64 -d; echo
+
+# ── Canary ───────────────────────────────────────────────────────────────────
+kubectl get rollout gateway -n llm-gateway -w          # Progressing / Paused / Healthy / Degraded
+kubectl describe rollout gateway -n llm-gateway        # current step, why it aborted
+kubectl get analysisrun,job -n llm-gateway             # smoke tests
+kubectl logs -n llm-gateway job/<smoke-job>            # the 5 requests and PASS/FAIL
+kubectl patch rollout gateway -n llm-gateway --type merge \
+  -p "{\"spec\":{\"restartAt\":\"$(date -u +%FT%TZ)\"}}"   # restart all gateway pods
+# optional plugin (one file, no brew):
+#   curl -Lo /usr/local/bin/kubectl-argo-rollouts https://github.com/argoproj/argo-rollouts/releases/download/v1.10.0/kubectl-argo-rollouts-darwin-amd64
+#   kubectl argo rollouts get rollout gateway -n llm-gateway --watch | abort | promote --full
+
+# ── Monitoring ───────────────────────────────────────────────────────────────
+kubectl port-forward -n monitoring svc/monitoring-grafana 3000:80
+kubectl get secret grafana-admin -n monitoring -o jsonpath='{.data.admin-password}' | base64 -d; echo
+kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 9090:9090   # Prometheus UI
+kubectl port-forward -n llm-gateway <gateway-pod> 9100:9100 && curl -s localhost:9100/metrics | grep ^gateway_
+
+# ── Regenerate the DB init ConfigMap after changing db/ ─────────────────────
+kubectl create configmap db-init -n llm-gateway --from-file=db/ --dry-run=client -o yaml > k8s/db-init.yaml
+
+# ── Clean slate (deletes the Postgres data too) ─────────────────────────────
+kubectl delete namespace llm-gateway
+```
+
+---
+
+## 32. Troubleshooting
+
+**First rule:** read the **last** "caused by" error, then find the **first hop** that failed.
+
+| Symptom | Likely cause | First check |
+|---|---|---|
+| `Connection refused` on `localhost:…` | The port-forward isn't running (or its pod was replaced) | `lsof -nP -iTCP:8000 -sTCP:LISTEN`; restart the port-forward |
+| Grafana "failed to load its application files" | Grafana restarted mid-load (e.g. OOMKilled) and the tunnel died | `lastState.terminated.reason`; restart the port-forward |
+| Pod `Pending` | Not enough CPU/memory requests left on the node | `kubectl describe pod` → `Insufficient memory` |
+| `ImagePullBackOff` | `ghcr-pull` missing, token expired, or wrong tag | `kubectl describe pod` → Events |
+| `CreateContainerConfigError` | A referenced Secret/ConfigMap doesn't exist | `kubectl get secret -n <ns>` |
+| `CrashLoopBackOff` right after a cluster start | Booted before DNS/Postgres was ready | `kubectl logs --previous`; usually settles by itself |
+| `OOMKilled` (exit 137) | Memory limit too low | Raise the limit in Git |
+| Pods killed with "failed liveness probe" during boot | Slow boot on a busy node | The startup probe (already added) |
+| `connection refused` to a **Service IP** from inside a pod | That Service has no ready pods | `kubectl get endpointslice -n <ns>` |
+| Push made, nothing happens for minutes | Argo CD polls every ~3 min | The refresh annotation |
+| Argo CD `OutOfSync` forever / constant restarts of a Helm-installed pod | Random or `lookup`-based values in a chart | Diff two ReplicaSets' pod templates |
+| Rollout `Degraded` | The smoke test failed | `kubectl logs job/<smoke-job>`; fix in Git |
+| 401 on every call | New database = no tenants, or a local `.env` key used against the cluster | Create a tenant in the cluster |
+| Dashboard "No data" | No traffic yet, or the PodMonitor isn't picked up | `up{namespace="llm-gateway"}` in Explore |
+
+---
+
+## 33. What broke while building this, and the fixes
+
+| # | Problem | Root cause | Fix |
+|---|---|---|---|
+| 1 | Code changes didn't deploy by themselves | Tag `:dev` never changed, so no rollout | CI with SHA tags + tag commit |
+| 2 | The cluster couldn't pull the image | GHCR image private, no login | `ghcr-pull` read-only token |
+| 3 | A token was pasted into chat | — | Treated as leaked: revoked, recreated via hidden prompt |
+| 4 | New gateway pod: "connection refused" to Postgres | Postgres readiness timeout 1 s → flapped out of its Service under load (68× in 5 h) | `timeoutSeconds: 5` on Postgres + Redis |
+| 5 | Buggy versions would reach 100% | Rolling update only checks `/health` | Argo Rollouts canary + smoke test |
+| 6 | Argo Rollouts / Argo CD / chart CRDs failed to apply | CRDs > 256 KB annotation limit | Server-side apply |
+| 7 | CI would overwrite the smoke test's image | `sed` rewrites every `image:` line in `gateway.yaml` | Smoke test in its own file |
+| 8 | All 4 gateway pods killed while booting | Liveness judged from second 0, 1 s timeout | Startup probe + 3 s timeouts |
+| 9 | Capacity dropped to 3 pods during canary steps | Default `maxUnavailable: 25%` | `maxUnavailable: 0`, `maxSurge: 1` |
+| 10 | Monitoring "stuck" at Init | Just a slow first pull (Prometheus image 265 MB) | None needed |
+| 11 | Argo CD's Redis "connection refused" | Its init container hung after a cluster restart | Deleted the pod; a fresh one started |
+| 12 | Grafana restarted every 1–2 min | Chart generated a random password on every render (`lookup` doesn't work under Argo CD) → checksum changed | `grafana-admin` Secret + `existingSecret` |
+| 13 | Grafana UI failed to load | Grafana OOMKilled at 256 Mi when the UI opened | Limit 512 Mi |
+| 14 | Client got "connection refused" | The gateway port-forward wasn't running | Start it (3 terminals: Grafana, gateway, commands) |
+
+**Pattern worth remembering:** 4, 8 and 13 were all **default or guessed limits** (1 s probe timeouts, a
+256 Mi memory limit) that looked fine idle and failed under load. Watch real behaviour, then set limits.
+
+---
+
+## 34. Decisions and tradeoffs (interview stories)
+
+| Decision | Chose | Gave up | Other option wins when |
+|---|---|---|---|
+| Local cluster | minikube ($0) | Real cloud networking, LBs, Workload Identity | Budget exists (OKE) |
+| Manifests | Plain YAML in `k8s/` | Templating | Several environments → Kustomize overlays |
+| Databases | In-cluster Postgres + Redis | Backups, HA, patching | Any real data → managed DB |
+| Postgres controller | Deployment + PVC + Recreate | StatefulSet identity | Primary + standby replicas |
+| Redis storage | None | Counters rebuilt after restart | Data that exists nowhere else |
+| Secrets | Hand-created, never in Git | Full GitOps (manual rebuild steps) | Teams / many clusters → External Secrets + a vault |
+| Image tags | Git SHA, committed by CI | Bot commits in history | — |
+| Deploys | Argo CD pull-based, prune + selfHeal | Quick manual fixes (reverted) | Tiny projects where push-based is simpler |
+| Releases | Canary by pod count, 4 replicas | Exact % and per-request split | High traffic / 1% canaries → ingress weights |
+| Canary check | Smoke test (fake key → 401), $0 | Catching real-traffic errors | Metrics-based analysis (Project 4) |
+| Probes | Startup + liveness + readiness on `/health` (no DB) | Readiness blind to DB outages | Add `/ready` once traffic matters |
+| Metrics port | Separate 9100, PodMonitor | One more port | — (metrics are business data) |
+| Monitoring install | kube-prometheus-stack via Argo CD | Weight (~1–1.5 GB), chart quirks | Very small setups → plain Prometheus |
+| Prometheus storage | Temporary (no PVC), 3 d | History on restart | Any real use → PVC |
+| Dashboard | ConfigMap JSON in Git | Click-and-save convenience | — |
+| Error rate | 5xx only | Visibility of client misuse (still visible by status) | — |
+
+---
+
+## 35. Known limits
+
+| Limit | Impact | Upgrade path |
+|---|---|---|
+| Smoke test runs once, at 25% | Real-traffic bugs during the pauses reach 100% | Prometheus-based background analysis |
+| Canary split per connection | Few clients → uneven split | Ingress with traffic weights |
+| Readiness ignores DB health | Requests reach pods that return 503 | `/ready` endpoint |
+| `db-init` only runs on an empty DB; the ConfigMap is a copy of `db/` | New migrations don't apply; copy can drift | Migration Job + CI check |
+| Prometheus has no disk | History lost on its restart | `storageSpec` PVC |
+| Grafana has no disk | UI-only dashboard edits lost | Keep dashboards as ConfigMaps (already) |
+| Secrets outside Git | Manual steps on rebuild | External Secrets + OCI Vault |
+| `/metrics` readable by any pod in the cluster | Tenant usage visible inside the cluster | NetworkPolicy allowing only Prometheus |
+| Argo CD polls Git | Up to ~3 min deploy lag | Webhook (needs a public Argo CD) |
+| No alert receivers | Alerts go nowhere | Alertmanager receivers (SLO step) |
+| `argocd/*.yaml` applied by hand | Edits need a manual re-apply | App of apps |
+
+---
+
+## 36. Later: minikube → OKE
+
+```
+                    minikube (now, $0)                    OKE (when funded)
+                    ──────────────────                    ─────────────────
+ cluster created by minikube start                        terraform apply (infra/cluster)
+ nodes              1 container in Colima (amd64)         2 ARM VMs in a private subnet
+ image              GHCR (amd64)                          GHCR, multi-arch (add arm64 in CI)
+ public access      kubectl port-forward                  Service type LoadBalancer → OCI LB (public LB subnet)
+ Postgres disk      folder on the node                    OCI Block Volume
+ cloud permissions  none                                  Workload Identity (no static keys)
+ control-plane metrics  disabled (localhost only)         not scrapeable (Oracle runs it)
+ k8s/*.yaml         ──────────────── mostly the SAME files ────────────────
+ Argo CD            points at minikube                    points at OKE (same Git repo)
+```
+
+The bottom rows are the payoff of GitOps: the deploy definitions don't care which cluster runs them.
+
+---
+
+## 37. Check yourself
+
+**Q1.** I push a change to `gateway/limits.py`. List, in order, every system that acts on it until new pods
+serve traffic, and what each one does.
 <details><summary>Answer</summary>
-No. Env vars are read once at container start. The ConfigMap changed, but the Deployment's pod template
-didn't, so there was no rollout and the pods keep the old value. `kubectl rollout restart`, or a hashed
-ConfigMap name via Kustomize. See 17.
+GitHub Actions (paths filter matches) → build → Trivy scan → push to GHCR with the SHA tag → bot commits the
+tag into k8s/gateway.yaml → Argo CD polls Git (≤ 3 min) and applies the new Rollout spec → Argo Rollouts
+creates a new ReplicaSet and runs the steps (25% → smoke test → 2 m → 50% → 2 m → 100%) → the kubelet pulls
+the image with ghcr-pull and starts pods → the startup probe passes → readiness passes → the EndpointSlice
+adds them to the gateway Service. See 4, 17–21.
 </details>
 
-**Q7.** I make a typo: the gateway Service's selector says `app: gatway`. All pods are Running and Ready. What does a caller see, and why?
+**Q2.** I push a change to `k8s/config.yaml` only. Does CI run? Do the gateway pods get the new value?
 <details><summary>Answer</summary>
-Connection refused. The selector matches no pods, the EndpointSlice is empty, and kube-proxy rejects
-connections to a Service with no endpoints. Same symptom as the 4 startup restarts, but permanent.
-Check with `kubectl get endpointslice`. See 15–16.
+CI doesn't run (only image inputs trigger it). Argo CD updates the ConfigMap, but the pods keep the old env
+vars: they're copied in at container start, and the pod template didn't change, so there's no rollout.
+Restart the Rollout. See 12.1, 17.1.
 </details>
 
-**Q8.** Argo CD says **Synced + Degraded**. Whose fault is it, Argo CD's or the release's, and would rolling back with `kubectl rollout undo` stick?
+**Q3.** Someone runs `kubectl set image` on the gateway to roll back quickly. What happens?
 <details><summary>Answer</summary>
-The release's: Argo CD applied exactly what Git says, and what Git says doesn't work. `kubectl rollout undo`
-won't stick, because selfHeal sees the cluster no longer matches Git and re-applies the broken version.
-The GitOps rollback is `git revert` + push. See 19.
+Argo CD's live watch sees the cluster differ from Git, and selfHeal puts Git's image back within seconds.
+The rollback that sticks is `git revert` + push. See 19.5.
 </details>
 
-**Q9.** Why did deleting a gateway pod by hand (or scaling it) cause no downtime, but deleting the Postgres pod would?
+**Q4.** With 4 replicas and `setWeight: 25`, how many canary pods run, and why does the smoke test use
+`gateway-canary` instead of `gateway`?
 <details><summary>Answer</summary>
-The gateway has 2 ready replicas behind one Service, and the other keeps serving while the loop replaces
-the missing one. Postgres has 1 replica with `Recreate`, so until the new pod is ready the Service has no
-endpoints and the gateway's DB calls fail. See 5.5, 15, 16.
+ceil(4 × 0.25) = 1 canary pod (3 stable). `gateway` selects all 4 pods, so the test would hit the old
+version 75% of the time and pass even with a broken canary. `gateway-canary` gets the canary's hash added to
+its selector, so it reaches only the new pod. See 20.4, 20.5.
 </details>
+
+**Q5.** Why does `/health` not check Postgres, and what's the downside?
+<details><summary>Answer</summary>
+If it did, a Postgres blip would fail liveness on all 4 gateways at once, and they'd all be restarted
+together, turning a small outage into a full one. Downside: readiness stays "ready" while Postgres is down,
+so requests reach pods that answer 503. See 8.
+</details>
+
+**Q6.** Grafana shows "failed to load its application files". How do you find the cause in two commands?
+<details><summary>Answer</summary>
+`kubectl get pods -n monitoring` (RESTARTS > 0 recently?), then
+`kubectl get pod <grafana-pod> -n monitoring -o jsonpath='{.status.containerStatuses[*].lastState.terminated.reason}'`.
+Here it said OOMKilled: Grafana died mid-page-load, and the port-forward died with the pod. See 9, 13, 33.
+</details>
+
+**Q7.** Why is `gateway_requests_total` graphed as `rate(...[5m])` and not as its raw value?
+<details><summary>Answer</summary>
+It's a counter that only goes up and resets to 0 when a pod restarts (every canary release). The raw value
+shows meaningless cliffs; `rate()` turns it into requests per second and handles resets. See 23.2.
+</details>
+
+**Q8.** Why is the gateway scraped by a PodMonitor on port 9100 instead of a ServiceMonitor through the
+`gateway` Service?
+<details><summary>Answer</summary>
+The Services deliberately expose only port 8000, so tenant usage data can never leave through them (or a
+future public load balancer). A PodMonitor scrapes each pod's 9100 directly, inside the cluster. See 23.4, 26.1.
+</details>
+
+**Q9.** A caller sends 1,000 requests, each with a different made-up model name. What happens to
+Prometheus, and why?
+<details><summary>Answer</summary>
+Nothing bad: the model label is filtered to known models, and all 1,000 become model="other", a single
+series per tenant/status. Without the filter, each name would create new time series and could exhaust
+Prometheus' memory (cardinality). See 23.3.
+</details>
+
+**Q10.** The Prometheus pod restarts. What do you lose, and what do you keep?
+<details><summary>Answer</summary>
+You lose all stored metric history (no PVC). You keep the configuration (it comes from the operator and
+Git), the dashboards (ConfigMaps), and the gateway's own counters, which live in the gateway pods and are
+scraped again. See 27.
+</details>
+
+---
+
+## 38. Key terms
+
+| Simple words | Technical term | One line |
+|---|---|---|
+| Sealed lunchbox | Image | Code + dependencies + runtime, built once, runs anywhere |
+| Folder in the cluster | Namespace | Name scope + unit of cleanup and permissions |
+| A running lunchbox | Pod | 1+ containers sharing a network address |
+| Group of identical pods | ReplicaSet | One per version; Deployments and Rollouts manage them |
+| Manager with a release plan | Rollout (Argo Rollouts) | Like a Deployment, plus canary steps and analysis |
+| Phone number that never changes | Service | Stable DNS name + virtual IP in front of ready pods |
+| Notice board / locked drawer | ConfigMap / Secret | Settings as env vars. Secret ≠ encrypted |
+| Plugged-in hard drive | PersistentVolumeClaim | Storage that outlives the pod |
+| Three health questions | Startup / liveness / readiness probe | Wait / restart / stop sending traffic |
+| Reserve / ceiling | Request / limit | Used for scheduling / exceeding memory = OOMKilled |
+| Thermostat | Control loop / reconciliation | Observe → compare → act, forever |
+| Robot that makes the cluster match Git | Argo CD (GitOps) | Pull-based delivery with drift correction |
+| Taste test before serving everyone | Canary release | New version gets a small share first, then grows or aborts |
+| Taster | AnalysisTemplate / AnalysisRun | The check that decides promote or abort |
+| New Kubernetes kind | CRD | Custom resource definition (Rollout, PodMonitor…) |
+| Robot that configures an app from objects | Operator | A controller for custom resources (e.g. the Prometheus operator) |
+| Meter reader | Scrape | Prometheus fetching `/metrics` on a schedule |
+| Odometer / speedometer / weight bins | Counter / gauge / histogram | Metric types |
+| Lines in the notebook | Time series / cardinality | One per label combination; too many = out of memory |
+| "Scrape these pods" note | PodMonitor | Tells the Prometheus operator what to scrape |
+| Dashboard auto-loader | Grafana sidecar | Loads ConfigMaps labelled `grafana_dashboard: "1"` |
+| Dead man's switch | Watchdog alert | Always firing; silence means alerting is broken |
