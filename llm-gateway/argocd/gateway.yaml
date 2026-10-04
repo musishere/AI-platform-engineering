@@ -17,7 +17,8 @@ spec:
     # SSH URL because the credential is an SSH deploy key.
     repoURL: git@github.com:musishere/AI-platform-engineering.git
     targetRevision: main
-    path: k8s
+    # Path from the repo root, not from this file.
+    path: llm-gateway/k8s
   destination:
     # "This same cluster": Argo CD deploys into the cluster it runs in.
     server: https://kubernetes.default.svc

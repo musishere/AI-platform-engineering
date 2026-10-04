@@ -3,6 +3,8 @@
 ## What this repo is
 This is my personal LEARNING project, not a production product. The goal is to learn AI platform engineering by building, following ROADMAP.md (8 projects that grow one LLM gateway platform). Learning matters more than speed or finished code.
 
+All project files live in `llm-gateway/` (run commands from there). ROADMAP.md and LEARNING_LOG.md are in `llm-gateway/docs/`. Only `.github/` (GitHub reads workflows from the repo root), `.gitignore` and this file stay at the root.
+
 ## Who I am
 Backend engineer with ~3.5 years of experience (Node.js, NestJS, TypeScript, Rust, Python, Postgres, Redis, AWS). I already know backend basics like async/await, REST APIs, SQL, and auth. Don't explain those. Explain the NEW concepts: infrastructure design, LLM serving, GPUs, observability, platform design, and senior-level tradeoffs.
 

@@ -17,19 +17,19 @@ on:
     # Only when the image's contents can change. A k8s/-only change is a
     # config change Argo CD applies on its own; rebuilding would be waste.
     paths:
-      - gateway/**
-      - Dockerfile
-      - .dockerignore
-      - pyproject.toml
-      - uv.lock
+      - llm-gateway/gateway/**
+      - llm-gateway/Dockerfile
+      - llm-gateway/.dockerignore
+      - llm-gateway/pyproject.toml
+      - llm-gateway/uv.lock
       - .github/workflows/gateway.yml
   pull_request:
     paths:
-      - gateway/**
-      - Dockerfile
-      - .dockerignore
-      - pyproject.toml
-      - uv.lock
+      - llm-gateway/gateway/**
+      - llm-gateway/Dockerfile
+      - llm-gateway/.dockerignore
+      - llm-gateway/pyproject.toml
+      - llm-gateway/uv.lock
       - .github/workflows/gateway.yml
 
 # Two merges close together must not race: both would try to commit a tag,
@@ -38,6 +38,12 @@ on:
 concurrency:
   group: gateway-${{ github.ref }}
   cancel-in-progress: false
+
+# The project lives in llm-gateway/; every `run:` step starts there, so the
+# docker build context and the sed path below stay as they were.
+defaults:
+  run:
+    working-directory: llm-gateway
 
 env:
   # GHCR needs lowercase names; github.repository keeps my repo's capitals
