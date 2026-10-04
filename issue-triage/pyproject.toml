@@ -1,0 +1,16 @@
+# issue-triage: the flagship app (ROADMAP Projects 5-8).
+#
+# A GitHub App for open-source maintainers: for a new issue it finds likely
+# duplicates and past fixes, drafts a cited reply, and posts nothing until a
+# maintainer approves. Every Claude call goes through ../llm-gateway, so each
+# installed repo is a gateway tenant (its own key, quota, cost and traces).
+#
+# Separate project from the gateway on purpose: different libraries, different
+# deploy, and the gateway's image must never carry this app's dependencies.
+[project]
+name = "issue-triage"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+]
